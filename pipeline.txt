@@ -1,0 +1,85 @@
+# Pipeline Description for Facial Video/Image Preprocessing and Wavelet Feature/STI Extraction
+
+This document outlines the sequence of operations performed by the `preprocessing.py` script,
+including its interaction with `feature_extraction.py`, to process facial videos or images,
+perform ROI extraction, generate wavelet-based feature vectors incrementally, and construct
+Spatio-Temporal Images (STIs).
+
+## I. Initialization (Executed on script load)
+
+1.  **Import Libraries:** `cv2`, `numpy`, `mediapipe`, `os`, `landmark_pb2`.
+2.  **Import Custom Modules:** `extract_wavelet_features_from_diff`, `construct_and_resize_sti` from `feature_extraction.py`.
+3.  **Initialize MediaPipe:**
+    *   Call `initialize_face_landmarker()` function.
+    *   Configure `FaceLandmarkerOptions` (model path, VIDEO mode, confidence thresholds).
+    *   Create the `FaceLandmarker` instance and store it in a global variable (`face_landmarker`). This ensures the model is loaded only once.
+4.  **Define Constants:** Landmark indices, `TARGET_FPS`, `ROI_SIZE`, file extensions.
+
+## II. Main Execution (`if __name__ == '__main__':` block)
+
+1.  **Configuration:** Define `INPUT_SOURCE` (Note: Currently hardcoded, ideally use argsparse). Define `final_sti_size = (224, 224)`.
+2.  **Initialize Data Structures:** Feature vector lists (e.g., `forehead_feature_vectors`), `prev_..._roi` variables to `None`, single image ROI lists.
+3.  **Determine Input Type:** Check file extension.
+4.  **Branch Execution:** Video or Image Path.
+
+### II.A. Video Processing Path (`if is_video:`)
+
+1.  **(Consecutive)** **Standardize FPS:** Call `convert_video_to_30fps`.
+2.  **(Consecutive)** **Open Converted Video:** `cv2.VideoCapture`.
+3.  **(Consecutive)** **Frame-by-Frame Loop:** Iterate through frames.
+    *   **(Sub-step 1)** Calculate `timestamp_ms`.
+    *   **(Sub-step 2)** **Detect Landmarks:** `detect_face_and_landmarks_mediapipe`.
+    *   **(Sub-step 3 - Conditional)** If landmarks detected:
+        *   **(Parallel Sub-step 3.1)** Extract pixel coordinates.
+        *   **(Parallel Sub-step 3.2)** Define ROI Bounding Boxes.
+        *   **(Parallel Sub-step 3.3)** Extract ROI frame using `extract_roi_frame`.
+        *   **(Parallel Sub-step 3.4)** **Standardize ROI:** If extraction successful, resize ROI to `ROI_SIZE` using `cv2.resize(..., interpolation=cv2.INTER_AREA)`. Store result in `current_..._roi` (or `None` if extraction/resizing failed).
+        *   **(Parallel Sub-step 3.5 - Conditional Incremental Feature Extraction)** For each ROI type:
+            *   Check if *both* `prev_..._roi` and `current_..._roi` are valid.
+            *   Calculate temporal difference: `diff_frame = current_roi - prev_roi` (float32).
+            *   Call `extract_wavelet_features_from_diff(diff_frame)`.
+            *   If valid feature vector `fv` returned, append to `..._feature_vectors` list.
+        *   **(Parallel Sub-step 3.6 - Update Previous ROIs)** Update `prev_..._roi = current_..._roi` (storing the *standardized* ROI or `None`).
+        *   **(Parallel Sub-step 3.7 - Visualization)** Draw landmarks and *original* ROI boxes on `display_frame`.
+    *   **(Sub-step 4 - Conditional Reset)** If no landmarks detected, reset `prev_..._roi` variables to `None`.
+    *   **(Sub-step 5 - Visualization)** Display `display_frame`.
+    *   **(Sub-step 6)** Check for quit key.
+4.  **(Consecutive)** **Post-Loop Processing:**
+    *   Print number of feature vectors collected.
+    *   **(Conditional STI Construction)** For each ROI type:
+        *   If the corresponding `..._feature_vectors` list is not empty:
+            *   Call `construct_and_resize_sti(..._feature_vectors, target_size=final_sti_size)`.
+            *   Store the resulting 224x224 STI (e.g., `forehead_sti`).
+            *   Print status/shape of constructed STI.
+            *   **(Optional)** Visualize STI.
+    *   **(Cleanup)** Optionally delete temporary `_30fps.mp4` file.
+
+### II.B. Image Processing Path (`elif is_image:`)
+
+1.  **(Consecutive)** Read Image.
+2.  **(Consecutive)** Detect Landmarks (`timestamp_ms=0`).
+3.  **(Consecutive - Conditional)** If landmarks detected:
+    *   Extract coordinates, define ROIs.
+    *   Extract ROI frame.
+    *   **Standardize ROI:** Resize extracted ROI to `ROI_SIZE`.
+    *   Append the *standardized* single ROI frame to the image-specific sequence list (e.g., `forehead_roi_sequence`).
+    *   Draw landmarks/ROI boxes.
+4.  **(Consecutive - Visualization)** Display image, wait for key.
+5.  **(Consecutive)** Print number of standardized ROIs extracted (0 or 1). STIs are not generated.
+
+### II.C. Unsupported File Type Path (`else:`)
+
+1.  **(Consecutive)** Print error message.
+
+## III. Cleanup (`finally` block)
+
+1.  Release Video Capture.
+2.  Destroy Windows.
+3.  Close Landmarker.
+
+## IV. Outputs (Available after script execution)
+
+*   **(For Videos)** **Spatio-Temporal Images (NumPy arrays):** `forehead_sti`, `left_cheek_sti`, `right_cheek_sti`. These are the 224x224 images ready for CNN input (Path A).
+*   **(For Single Images Only)** **Standardized ROI Sequences (Lists of NumPy arrays):** `forehead_roi_sequence`, etc. Contain the single *standardized* extracted ROI frame.
+*   **Visualizations:** Displayed windows.
+*   **(Potentially)** The converted `_30fps.mp4` file.

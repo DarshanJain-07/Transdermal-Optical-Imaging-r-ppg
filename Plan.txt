@@ -1,0 +1,96 @@
+# Unified Algorithm: Motion and Illumination Robust Heart Rate Estimation
+
+## Input
+- RGB facial video
+
+## Output
+- Estimated Heart Rate (HR) in beats per minute (BPM)
+
+## Algorithm Overview
+
+### 1. Preprocessing
+1. **Video Standardization** [DONE]
+   - Convert input video to 30 fps
+   - Ensure correct video format and dimensions
+
+2. **Face and Landmark Detection** [DONE]
+   - Use MediaPipe FaceLandmarker to detect 478 facial landmarks
+   - Track landmarks using MediaPipe's VIDEO mode for temporal consistency
+
+3. **ROI Extraction** [DONE]
+   - Extract multiple ROIs (forehead, left cheek, right cheek) based on landmark positions
+   - Standardize ROI sizes by resizing each extracted ROI to fixed dimensions [DONE]
+
+### 2. Feature Extraction (Hybrid Approach)
+
+#### Path A: Wavelet-Based Features
+1. **Temporal Differencing** [DONE]
+   - Calculate difference between consecutive *standardized* ROI frames: `diff_frame[t] = frame[t+1] - frame[t]` (Implemented incrementally)
+
+2. **Wavelet Transform** [DONE]
+   - Apply 3-scale Daubechies wavelet transform (`db4`) to each channel of the difference frame
+   - Extract HL and LH subbands at each scale (6 subbands total per channel)
+
+3. **Projection Vectors** [DONE]
+   - Compute horizontal projection for each HL subband: `Hr(x) = ∑_y subband(x,y)`
+   - Compute vertical projection for each LH subband: `Vr(y) = ∑_x subband(x,y)`
+
+4. **Feature Vector Construction** [DONE]
+   - Concatenate all projection vectors *per channel*
+   - Concatenate feature vectors from all channels to form a combined feature vector (FV) for each time step
+   - FV = [FV_Ch1, FV_Ch2, FV_Ch3] where FV_Ch = [Hr_HL1, Vr_LH1, Hr_HL2, Vr_LH2, Hr_HL3, Vr_LH3]
+
+5. **STI Construction** [DONE]
+   - Arrange FVs sequentially (stack vertically) to form a 2D Spatio-Temporal Image (STI)
+   - Resize STI to 224×224 for CNN input
+
+#### Path B: Illumination-Robust Features
+1. **Multi-Scale Retinex (MSR)** [TODO]
+   - Apply MSR to enhance illumination invariance:
+     - Convert image to log domain: `i(x,y) = log(I(x,y))`
+     - Apply multiple Gaussian filters at different scales
+     - Combine results: `MSR(x,y) = ∑_n w_n * [i(x,y) - log(I(x,y) * G_n(x,y))]`
+
+2. **RGB-MSR Fusion** [TODO]
+   - Extract base layers from RGB (Φ₁) and MSR (Φ₂) using mean filter
+   - Fuse base layers: `α_b(x,y) = (α_b1(x,y) + α_b2(x,y))/2`
+   - Extract detail layers: `α_d1(x,y) = Φ₁(x,y) - α_b1(x,y)`, `α_d2(x,y) = Φ₂(x,y) - α_b2(x,y)`
+   - Calculate saliency maps using mean and median filters
+   - Calculate weight maps: `ω₁(x,y) = ζ₁(x,y)/(ζ₁(x,y) + ζ₂(x,y))`, `ω₂(x,y) = ζ₂(x,y)/(ζ₁(x,y) + ζ₂(x,y))`
+   - Fuse detail layers: `α_d(x,y) = ω₁(x,y)α_d1(x,y) + ω₂(x,y)α_d2(x,y)`
+   - Combine layers: `γ(x,y) = α_d(x,y) + α_b(x,y)`
+
+3. **Block-Based Feature Extraction** [TODO]
+   - Divide fused ROI (γ) into k blocks of equal size
+   - Calculate average RGB values for each block: `F_i(t) = ∑_{(x,y)∈ROI_i} γ(x,y,t)/|ROI_i|`
+   - Arrange into N_f × k × 3 spatiotemporal map (N_f = number of frames)
+
+### 3. Feature Combination [TODO]
+- **Option 1**: Apply wavelet-based approach (Path A) to the fused images from Path B
+- **Option 2**: Concatenate features from both paths into a combined feature representation
+- **Option 3**: Use two parallel CNN streams, one for each feature type, then merge
+
+### 4. HR Estimation using CNN [TODO]
+1. **Model Architecture**
+   - Use ResNet18 backbone with modifications for regression output
+   - Replace final fully connected layer with HR output layer (linear activation)
+
+2. **Training Strategy**
+   - Loss function: L1 Loss or MSE
+   - Optimizer: Adam (learning rate = 0.0005)
+   - Regularization: Dropout (p = 0.6)
+   - Data window: 5 seconds (150 frames at 30 fps)
+   - Training epochs: 70
+   - Batch size: 32
+   - 10-fold cross-validation
+
+### 5. Post-processing [TODO]
+- Apply temporal smoothing to HR predictions
+- Filter outliers based on physiological constraints (40-180 BPM)
+
+## Evaluation Metrics [TODO]
+- Standard Deviation (SD)
+- Mean Absolute Error (MAE)
+- Root Mean Square Error (RMSE)
+- Mean Error Rate (MER)
+- Pearson Correlation Coefficient (ρ)

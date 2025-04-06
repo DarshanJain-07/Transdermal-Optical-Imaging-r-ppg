@@ -1,96 +1,144 @@
 # Unified Algorithm: Motion and Illumination Robust Heart Rate Estimation
 
 ## Input
-- RGB facial video
+- `video_in`: RGB facial video file path.
 
 ## Output
-- Estimated Heart Rate (HR) in beats per minute (BPM)
+- `HR_estimate`: Estimated Heart Rate (HR) in beats per minute (BPM).
 
 ## Algorithm Overview
 
 ### 1. Preprocessing
-1. **Video Standardization** [DONE]
-   - Convert input video to 30 fps
-   - Ensure correct video format and dimensions
 
-2. **Face and Landmark Detection** [DONE]
-   - Use MediaPipe FaceLandmarker to detect 478 facial landmarks
-   - Track landmarks using MediaPipe's VIDEO mode for temporal consistency
+1.1. **Video Standardization** [DONE]
+    - Input: `video_in`
+    - Convert video to target FPS (e.g., `TARGET_FPS = 30`).
+    - Output: `video_std` (video file at `TARGET_FPS`).
 
-3. **ROI Extraction** [DONE]
-   - Extract multiple ROIs (forehead, left cheek, right cheek) based on landmark positions
-   - Standardize ROI sizes by resizing each extracted ROI to fixed dimensions [DONE]
+1.2. **Initialization** [DONE]
+    - Initialize MediaPipe FaceLandmarker (`face_landmarker`) for video mode.
+    - Initialize data structures:
+        - `combined_features_roi1`, `combined_features_roi2`, ... (empty lists for each ROI)
+        - `prev_roi1`, `prev_roi2`, ... (set to `None`)
+        - `prev_block_fv_roi1`, `prev_block_fv_roi2`, ... (set to `None`)
+    - Define ROI landmark indices (`FOREHEAD_POINTS`, `LEFT_CHEEK_POINTS`, etc.).
+    - Define standardized ROI size `ROI_SIZE = (W_roi, H_roi)` (e.g., 64x64).
+    - Define final STI size `STI_SIZE = (W_sti, H_sti)` (e.g., 224x224).
 
-### 2. Feature Extraction (Hybrid Approach)
+1.3. **Video Frame Iteration** [DONE]
+    - Open `video_std`.
+    - For each frame `frame(t)` at index `t` (starting from `t=0`):
 
-#### Path A: Wavelet-Based Features
-1. **Temporal Differencing** [DONE]
-   - Calculate difference between consecutive *standardized* ROI frames: `diff_frame[t] = frame[t+1] - frame[t]` (Implemented incrementally)
+        1.3.1. **Face and Landmark Detection** [DONE]
+            - Calculate timestamp `ts = t * (1000 / TARGET_FPS)`.
+            - Detect face landmarks using `face_landmarker.detect_for_video(frame(t), ts)`.
+            - If no landmarks detected, set `current_roi_k = None` for all ROIs `k`, set `current_block_fv_k = None` for all `k`, goto step 1.3.6.
+            - Extract normalized landmarks `landmarks_norm`.
+            - Convert to pixel coordinates `landmarks_px(t)` based on `frame(t)` dimensions.
 
-2. **Wavelet Transform** [DONE]
-   - Apply 3-scale Daubechies wavelet transform (`db4`) to each channel of the difference frame
-   - Extract HL and LH subbands at each scale (6 subbands total per channel)
+        1.3.2. **ROI Extraction and Standardization** [DONE]
+            - For each ROI `k` (e.g., forehead, left_cheek, right_cheek):
+                - Select subset of `landmarks_px(t)` based on predefined indices for ROI `k`.
+                - Calculate bounding box `bbox_k(t) = (x, y, w, h)` using `get_bounding_box` on the subset.
+                - (*Alternative Considered & Rejected: Define ROI using `cv2.convexHull` on the subset, create a mask, and apply it before extracting/resizing. Rejected due to added complexity vs. bounding box.*)
+                - Extract ROI pixels `roi_raw_k(t)` from `frame(t)` using `bbox_k(t)`.
+                - If `roi_raw_k(t)` is valid:
+                    - Resize to standard size: `current_roi_k(t) = resize(roi_raw_k(t), ROI_SIZE)`. Convert to `float32`.
+                - Else:
+                    - `current_roi_k(t) = None`.
 
-3. **Projection Vectors** [DONE]
-   - Compute horizontal projection for each HL subband: `Hr(x) = ∑_y subband(x,y)`
-   - Compute vertical projection for each LH subband: `Vr(y) = ∑_x subband(x,y)`
+        1.3.3. **Feature Calculation (Concurrent Paths A & B for frame t)**
+            - For each ROI `k`:
+                - **Path A: Wavelet Features (`wavelet_fv_k(t)`)** [DONE]
+                    - Requires `current_roi_k(t)` and `prev_roi_k` (from frame `t-1`).
+                    - If `current_roi_k(t)` and `prev_roi_k` are valid:
+                        - Calculate temporal difference: `diff_k(t) = current_roi_k(t) - prev_roi_k`.
+                        - Apply 3-level 2D DWT (`db4`) to each channel of `diff_k(t)`.
+                        - Extract HL/LH subbands for levels 1, 2, 3.
+                        - Calculate horizontal projections `Hr` for HL, vertical `Vr` for LH.
+                        - Concatenate projections per channel, then across channels: `wavelet_fv_k(t) = concat(...)`.
+                    - Else:
+                        - `wavelet_fv_k(t) = None`.
 
-4. **Feature Vector Construction** [DONE]
-   - Concatenate all projection vectors *per channel*
-   - Concatenate feature vectors from all channels to form a combined feature vector (FV) for each time step
-   - FV = [FV_Ch1, FV_Ch2, FV_Ch3] where FV_Ch = [Hr_HL1, Vr_LH1, Hr_HL2, Vr_LH2, Hr_HL3, Vr_LH3]
+                - **Path B: Block Features (`current_block_fv_k(t)`)** [DONE]
+                    - Requires `current_roi_k(t)`.
+                    - If `current_roi_k(t)` is valid:
+                        - Apply MSR: `msr_k(t) = apply_msr(current_roi_k(t))`.
+                        - If `msr_k(t)` is valid:
+                            - Fuse: `fused_k(t) = fuse_rgb_msr(current_roi_k(t), msr_k(t))`.
+                            - If `fused_k(t)` is valid:
+                                - Divide `fused_k(t)` into `N x N` blocks (e.g., `N=4`).
+                                - Calculate mean RGB per block.
+                                - Flatten results: `current_block_fv_k(t) = flatten(mean_block_values)`.
+                            - Else: `current_block_fv_k(t) = None`.
+                        - Else: `current_block_fv_k(t) = None`.
+                    - Else:
+                        - `current_block_fv_k(t) = None`.
 
-5. **STI Construction** [DONE]
-   - Arrange FVs sequentially (stack vertically) to form a 2D Spatio-Temporal Image (STI)
-   - Resize STI to 224×224 for CNN input
+        1.3.4. **Feature Combination** [DONE]
+            - For each ROI `k`:
+                - Requires `wavelet_fv_k(t)` (from diff `t-1` to `t`) and `prev_block_fv_k` (from frame `t-1`).
+                - If `wavelet_fv_k(t)` is not `None` AND `prev_block_fv_k` is not `None`:
+                    - Concatenate: `combined_fv_k(t) = concat(wavelet_fv_k(t), prev_block_fv_k)`.
+                    - Append `combined_fv_k(t)` to `combined_features_roi_k` list.
 
-#### Path B: Illumination-Robust Features
-1. **Multi-Scale Retinex (MSR)** [TODO]
-   - Apply MSR to enhance illumination invariance:
-     - Convert image to log domain: `i(x,y) = log(I(x,y))`
-     - Apply multiple Gaussian filters at different scales
-     - Combine results: `MSR(x,y) = ∑_n w_n * [i(x,y) - log(I(x,y) * G_n(x,y))]`
+        1.3.5. **Visualization (Optional)** [DONE]
+            - Draw landmarks and ROI bounding boxes on a copy of `frame(t)`. Display.
 
-2. **RGB-MSR Fusion** [TODO]
-   - Extract base layers from RGB (Φ₁) and MSR (Φ₂) using mean filter
-   - Fuse base layers: `α_b(x,y) = (α_b1(x,y) + α_b2(x,y))/2`
-   - Extract detail layers: `α_d1(x,y) = Φ₁(x,y) - α_b1(x,y)`, `α_d2(x,y) = Φ₂(x,y) - α_b2(x,y)`
-   - Calculate saliency maps using mean and median filters
-   - Calculate weight maps: `ω₁(x,y) = ζ₁(x,y)/(ζ₁(x,y) + ζ₂(x,y))`, `ω₂(x,y) = ζ₂(x,y)/(ζ₁(x,y) + ζ₂(x,y))`
-   - Fuse detail layers: `α_d(x,y) = ω₁(x,y)α_d1(x,y) + ω₂(x,y)α_d2(x,y)`
-   - Combine layers: `γ(x,y) = α_d(x,y) + α_b(x,y)`
+        1.3.6. **Update Previous State** [DONE]
+            - For each ROI `k`:
+                - `prev_roi_k = current_roi_k(t)` (Store the standardized ROI from frame `t`).
+                - `prev_block_fv_k = current_block_fv_k(t)` (Store block features from frame `t`).
 
-3. **Block-Based Feature Extraction** [TODO]
-   - Divide fused ROI (γ) into k blocks of equal size
-   - Calculate average RGB values for each block: `F_i(t) = ∑_{(x,y)∈ROI_i} γ(x,y,t)/|ROI_i|`
-   - Arrange into N_f × k × 3 spatiotemporal map (N_f = number of frames)
+### 2. Combined STI Construction [DONE]
+- For each ROI `k`:
+    - Input: List `combined_features_roi_k`.
+    - If list is not empty:
+        - Stack features vertically: `STI_k = vstack(combined_features_roi_k)`.
+        - Resize to target CNN input size: `final_STI_k = resize(STI_k, STI_SIZE, interpolation=INTER_LINEAR)`.
+    - Else:
+        - `final_STI_k = None`.
+- Output: `final_STI_forehead`, `final_STI_left_cheek`, `final_STI_right_cheek`. These are the inputs for the CNN. Note: The algorithm currently produces one STI per ROI. Depending on the CNN architecture, these might be used separately or combined further.
 
-### 3. Feature Combination [TODO]
-- **Option 1**: Apply wavelet-based approach (Path A) to the fused images from Path B
-- **Option 2**: Concatenate features from both paths into a combined feature representation
-- **Option 3**: Use two parallel CNN streams, one for each feature type, then merge
+### 3. HR Estimation using CNN
 
-### 4. HR Estimation using CNN [TODO]
-1. **Model Architecture**
-   - Use ResNet18 backbone with modifications for regression output
-   - Replace final fully connected layer with HR output layer (linear activation)
+3.1. **Model Architecture** [DONE]
+    - Defined in `model.py` as class `Enhanced_HR_CNN(nn.Module)`.
+    - Uses `torchvision.models.resnet18` as a backbone (optionally with pre-trained weights).
+    - Modifies the first convolutional layer (`conv1`) to accept 3 input channels (stacked STIs).
+    - Includes `AttentionBlock` modules after ResNet layers 2 and 4.
+    - Extracts multi-scale features (pooled from layers 2, 3, 4) and concatenates them.
+    - Replaces the final ResNet fully connected layer with an `MLPHead` (multi-layer perceptron with BatchNorm, Dropout) for regression.
+    - Expected Input: Batch of stacked STIs, `(N, 3, H_sti, W_sti)`, e.g., `(N, 3, 224, 224)`.
+    - Output: Batch of predicted HRs, `(N, 1)`.
 
-2. **Training Strategy**
-   - Loss function: L1 Loss or MSE
-   - Optimizer: Adam (learning rate = 0.0005)
-   - Regularization: Dropout (p = 0.6)
-   - Data window: 5 seconds (150 frames at 30 fps)
-   - Training epochs: 70
-   - Batch size: 32
-   - 10-fold cross-validation
+3.2. **Training Strategy** [Partially DONE - Trainer defined]
+    - **Loss Function:** Custom `HREstimationLoss` (MSE + L1 + Correlation) defined in `model.py` [DONE].
+    - **Optimizer:** AdamW (default in `HR_Trainer`) [DONE].
+    - **Regularization:** Dropout (in `MLPHead`) and Weight Decay (in `HR_Trainer`) are included [DONE].
+    - **Learning Rate Scheduling:** `ReduceLROnPlateau` included in `HR_Trainer` [DONE].
+    - **Gradient Clipping:** Included in `HR_Trainer` [DONE].
+    - **Data Augmentation:** Basic augmentations (flip, noise) included in `HR_Trainer` [DONE].
+    - **Trainer Class:** `HR_Trainer` defined in `model.py` to manage training/validation loops, optimization, scheduling, metrics [DONE].
+    - **Dataset/DataLoader:** Requires implementation [TODO]. Needs custom PyTorch `Dataset` to load preprocessed `stacked_input_sti` files and corresponding ground truth HR. `DataLoader` for batching/shuffling.
+    - **Training Loop Script (`train.py` or notebook):** Requires implementation [TODO]. Needs to orchestrate dataset loading, model initialization, trainer usage over epochs, model saving, and potentially validation/early stopping logic.
+    - **Input Data:** Preprocessed pairs of (`stacked_input_sti`, `ground_truth_HR`) needed [TODO].
+    - **Window size:** Define how video segments (e.g., 5s) map to STIs and ground truth [Implicit TODO].
+    - **Epochs:** 70 (as planned, adjustable) [TODO].
+    - **Batch size:** 32 (as planned, adjustable) [TODO].
+    - **Validation:** 10-fold cross-validation setup needed [TODO].
 
-### 5. Post-processing [TODO]
-- Apply temporal smoothing to HR predictions
-- Filter outliers based on physiological constraints (40-180 BPM)
+### 4. Post-processing [TODO]
+    - Requires implementation in inference script.
+    - Input: Sequence of HR predictions from CNN over time windows.
+    - Apply temporal smoothing (e.g., moving average filter).
+    - Filter predictions outside physiological range (e.g., 40-180 BPM).
+    - Output: `HR_estimate`.
 
 ## Evaluation Metrics [TODO]
-- Standard Deviation (SD)
-- Mean Absolute Error (MAE)
-- Root Mean Square Error (RMSE)
-- Mean Error Rate (MER)
-- Pearson Correlation Coefficient (ρ)
+    - To be calculated during/after training/validation/testing.
+    - Standard Deviation (SD)
+    - Mean Absolute Error (MAE)
+    - Root Mean Square Error (RMSE)
+    - Mean Error Rate (MER): `mean(|predicted_HR - actual_HR| / actual_HR)`
+    - Pearson Correlation Coefficient (ρ) between predicted and actual HR sequences.

@@ -1,7 +1,4 @@
 opencv-python
 mediapipe
-numpy
-torch
-torchvision
-scikit-learn
+numpy==1.26.4
 pywavelets

@@ -149,12 +149,6 @@ def extract_wavelet_features_from_diff(diff_frame, wavelet='db4', levels=3):
     combined_feature_vector = np.concatenate(all_channel_features)
     return combined_feature_vector
 
-def visualize_subbands(subbands):
-    for name, coeffs in subbands.items():
-        norm_coeffs = cv2.normalize(coeffs, None, 0, 255, cv2.NORM_MINMAX)
-        cv2.imshow(f"Subband {name}", norm_coeffs.astype(np.uint8))
-    cv2.waitKey(25)
-
 def construct_and_resize_sti(feature_vector_sequence, target_size=(224, 224)):
     """
     Constructs a Spatio-Temporal Image (STI) from a sequence of feature vectors
@@ -196,3 +190,187 @@ def construct_and_resize_sti(feature_vector_sequence, target_size=(224, 224)):
     except Exception as e:
         print(f"Error during STI construction or resizing: {e}")
         return None
+
+# --- Illumination-Robust Features (Path B) ---
+
+def apply_msr(image, scales=[15, 80, 200], apply_log=True, epsilon=1e-6):
+    """
+    Applies Multi-Scale Retinex (MSR) to an image.
+
+    Args:
+        image (np.ndarray): Input image (H, W, C), expected to be float type (e.g., 0-255).
+        scales (list): List of sigma values for Gaussian blur kernels.
+        apply_log (bool): Whether to apply log transformation (standard MSR).
+        epsilon (float): Small value to add before log to avoid log(0).
+
+    Returns:
+        np.ndarray: The MSR processed image (float type), same shape as input.
+                    Returns None if input is invalid.
+    """
+    if not isinstance(image, np.ndarray) or image.ndim != 3:
+        print("Error: Invalid input image for MSR. Expected (H, W, C).")
+        return None
+
+    # Ensure float type for calculations
+    image_float = image.astype(np.float32)
+
+    msr_output = np.zeros_like(image_float)
+    num_scales = len(scales)
+    weight = 1.0 / num_scales # Equal weights for each scale
+
+    # Process each channel independently
+    for c in range(image.shape[2]):
+        channel = image_float[:, :, c]
+
+        # Apply log if required
+        if apply_log:
+            log_channel = np.log10(channel + epsilon)
+        else:
+            log_channel = channel # Use original values if log is disabled
+
+        for scale in scales:
+            # Gaussian blur
+            # Use (0,0) kernel size so it's derived from sigma
+            blurred = cv2.GaussianBlur(channel, (0, 0), sigmaX=scale, sigmaY=scale)
+
+            # Log of blurred image
+            if apply_log:
+                log_blurred = np.log10(blurred + epsilon)
+            else:
+                log_blurred = blurred # Use original values if log is disabled
+
+            # Difference
+            diff = log_channel - log_blurred
+
+            # Accumulate weighted difference
+            msr_output[:, :, c] += weight * diff
+
+    # Optional: Scale result back to a common range (e.g., 0-255)
+    # This depends on how the subsequent fusion expects the input.
+    # For now, returning the float result.
+    # Example scaling:
+    # msr_output = cv2.normalize(msr_output, None, 0, 255, cv2.NORM_MINMAX)
+
+    return msr_output
+
+def fuse_rgb_msr(rgb_roi, msr_roi, base_filter_ksize=5, epsilon=1e-12):
+    """
+    Fuses an RGB ROI with its MSR counterpart based on the plan.
+
+    Args:
+        rgb_roi (np.ndarray): The original standardized ROI (H, W, C), float32.
+        msr_roi (np.ndarray): The MSR processed ROI (H, W, C), float32.
+        base_filter_ksize (int): Kernel size for the mean filter for base layers.
+        epsilon (float): Small value to avoid division by zero in weight calculation.
+
+    Returns:
+        np.ndarray: The fused image (gamma) as float32 (H, W, C),
+                    or None if inputs are invalid.
+    """
+    if rgb_roi is None or msr_roi is None or rgb_roi.shape != msr_roi.shape or rgb_roi.ndim != 3:
+        print("Error: Invalid inputs for RGB-MSR fusion.")
+        return None
+    if rgb_roi.dtype != np.float32:
+        rgb_roi = rgb_roi.astype(np.float32)
+    if msr_roi.dtype != np.float32:
+        msr_roi = msr_roi.astype(np.float32)
+
+    # 1. Extract Base Layers (using average/box filter)
+    # Using cv2.blur which is a normalized box filter
+    base1 = cv2.blur(rgb_roi, (base_filter_ksize, base_filter_ksize))
+    base2 = cv2.blur(msr_roi, (base_filter_ksize, base_filter_ksize))
+
+    # 2. Fuse Base Layers
+    fused_base = (base1 + base2) / 2.0
+
+    # 3. Extract Detail Layers
+    detail1 = rgb_roi - base1
+    detail2 = msr_roi - base2
+
+    # 4. Calculate Saliency Maps (using absolute detail layers as proxy)
+    saliency1 = np.abs(detail1)
+    saliency2 = np.abs(detail2)
+    # Sum saliency across channels for weighting, or weight per channel?
+    # Let's try per-channel weighting first for simplicity.
+    # saliency1_sum = np.sum(saliency1, axis=2, keepdims=True)
+    # saliency2_sum = np.sum(saliency2, axis=2, keepdims=True)
+    # total_saliency = saliency1_sum + saliency2_sum + epsilon
+
+    # Per-channel weighting:
+    total_saliency = saliency1 + saliency2 + epsilon
+
+    # 5. Calculate Weight Maps
+    weight1 = saliency1 / total_saliency
+    weight2 = saliency2 / total_saliency
+    # Ensure weights sum to 1 (or close to it)
+    # weight1 = saliency1_sum / total_saliency
+    # weight2 = saliency2_sum / total_saliency
+
+    # 6. Fuse Detail Layers
+    fused_detail = weight1 * detail1 + weight2 * detail2
+
+    # 7. Combine Layers
+    gamma = fused_base + fused_detail
+
+    # Optional: Clip result to a valid range if needed (e.g., 0-255)
+    # gamma = np.clip(gamma, 0, 255)
+
+    return gamma
+
+def extract_block_features(fused_roi, num_blocks_sqrt=4):
+    """
+    Divides the fused ROI into k=num_blocks_sqrt^2 blocks and calculates
+    the average RGB value for each block.
+
+    Args:
+        fused_roi (np.ndarray): The fused ROI image (gamma) (H, W, C), float32.
+        num_blocks_sqrt (int): The square root of the number of blocks (k).
+                               E.g., 4 means the image will be divided into 4x4=16 blocks.
+
+    Returns:
+        np.ndarray: A 1D array containing the average RGB values for all blocks,
+                    flattened. Shape: (k * C,). Returns None if input is invalid.
+    """
+    if fused_roi is None or fused_roi.ndim != 3:
+        print("Error: Invalid input fused_roi for block feature extraction.")
+        return None
+
+    H, W, C = fused_roi.shape
+    k = num_blocks_sqrt * num_blocks_sqrt
+    block_features = np.zeros((k, C), dtype=np.float32)
+
+    # Calculate block dimensions
+    block_h = H // num_blocks_sqrt
+    block_w = W // num_blocks_sqrt
+
+    if block_h == 0 or block_w == 0:
+        print(f"Error: ROI size ({H}x{W}) too small for {k} blocks.")
+        return None
+
+    block_idx = 0
+    for r in range(num_blocks_sqrt):
+        for c_block in range(num_blocks_sqrt):
+            # Define block boundaries
+            y1 = r * block_h
+            y2 = y1 + block_h
+            x1 = c_block * block_w
+            x2 = x1 + block_w
+
+            # Extract block
+            block = fused_roi[y1:y2, x1:x2, :]
+
+            # Calculate average RGB (or other channel) values for the block
+            # Handle potential empty blocks if ROI size not perfectly divisible
+            if block.size > 0:
+                avg_vals = np.mean(block, axis=(0, 1))
+                block_features[block_idx, :] = avg_vals
+            else:
+                 # Handle empty block case if needed (e.g., set to zero or previous)
+                 block_features[block_idx, :] = 0.0
+
+            block_idx += 1
+
+    # Flatten the (k, C) array to (k * C,)
+    return block_features.flatten()
+
+# --- Spatio-Temporal Image (STI) Construction (Path A) ---

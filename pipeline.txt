@@ -1,57 +1,80 @@
-# Pipeline Description for Facial Video/Image Preprocessing and Wavelet Feature/STI Extraction
+# Pipeline Description: Combined Feature Extraction for HR Estimation
 
-This document outlines the sequence of operations performed by the `preprocessing.py` script,
-including its interaction with `feature_extraction.py`, to process facial videos or images,
-perform ROI extraction, generate wavelet-based feature vectors incrementally, and construct
-Spatio-Temporal Images (STIs).
+This document outlines the sequence of operations performed by `preprocessing.py`,
+including its interaction with `feature_extraction.py`, to process facial videos/images,
+extract ROIs, calculate and combine wavelet-based temporal features (Path A) and
+illumination-robust block features (Path B), and construct a final Spatio-Temporal Image (STI).
 
 ## I. Initialization (Executed on script load)
 
-1.  **Import Libraries:** `cv2`, `numpy`, `mediapipe`, `os`, `landmark_pb2`.
-2.  **Import Custom Modules:** `extract_wavelet_features_from_diff`, `construct_and_resize_sti` from `feature_extraction.py`.
+1.  **Import Libraries:** `cv2`, `numpy`, `mediapipe`, `os`, `argparse`, `landmark_pb2`.
+2.  **Import Custom Modules:** From `feature_extraction.py` import:
+    *   `extract_wavelet_features_from_diff`, `construct_and_resize_sti` (Path A components)
+    *   `apply_msr`, `fuse_rgb_msr`, `extract_block_features` (Path B components)
 3.  **Initialize MediaPipe:**
-    *   Call `initialize_face_landmarker()` function.
-    *   Configure `FaceLandmarkerOptions` (model path, VIDEO mode, confidence thresholds).
-    *   Create the `FaceLandmarker` instance and store it in a global variable (`face_landmarker`). This ensures the model is loaded only once.
-4.  **Define Constants:** Landmark indices, `TARGET_FPS`, `ROI_SIZE`, file extensions.
+    *   Call `initialize_face_landmarker()`.
+    *   Configure `FaceLandmarkerOptions` (model path, VIDEO mode, thresholds).
+    *   Create global `face_landmarker` instance.
+4.  **Define Constants:** Landmark indices (`FOREHEAD_POINTS`, etc.), `ROI_SIZE`, `TARGET_FPS`, file extensions.
 
 ## II. Main Execution (`if __name__ == '__main__':` block)
 
-1.  **Configuration:** Define `INPUT_SOURCE` (Note: Currently hardcoded, ideally use argsparse). Define `final_sti_size = (224, 224)`.
-2.  **Initialize Data Structures:** Feature vector lists (e.g., `forehead_feature_vectors`), `prev_..._roi` variables to `None`, single image ROI lists.
-3.  **Determine Input Type:** Check file extension.
-4.  **Branch Execution:** Video or Image Path.
+1.  **Parse Command Line Arguments:** Use `argparse` to get `INPUT_SOURCE` and `VISUALIZE` flag.
+2.  **Configuration:** Define `final_sti_size = (224, 224)`.
+3.  **Initialize Data Structures:**
+    *   Combined feature lists: `combined_forehead_features = []`, `combined_left_cheek_features = []`, etc.
+    *   Previous frame state variables: `prev_forehead_roi = None`, `prev_left_cheek_roi = None`, etc.
+    *   Previous frame block features: `prev_block_features_forehead = None`, etc.
+    *   Single image ROI lists (if image input).
+4.  **Determine Input Type:** Check file extension (`is_video`, `is_image`).
+5.  **Branch Execution:** Video or Image Path.
 
 ### II.A. Video Processing Path (`if is_video:`)
 
-1.  **(Consecutive)** **Standardize FPS:** Call `convert_video_to_30fps`.
-2.  **(Consecutive)** **Open Converted Video:** `cv2.VideoCapture`.
-3.  **(Consecutive)** **Frame-by-Frame Loop:** Iterate through frames.
+1.  **(Consecutive)** **Standardize FPS:** Call `convert_video_to_30fps` -> `converted_video_path`.
+2.  **(Consecutive)** **Open Converted Video:** `cap = cv2.VideoCapture(converted_video_path)`.
+3.  **(Consecutive)** **Frame-by-Frame Loop:** Iterate through frames `frame(t)` (`t`=0, 1, ...).
     *   **(Sub-step 1)** Calculate `timestamp_ms`.
-    *   **(Sub-step 2)** **Detect Landmarks:** `detect_face_and_landmarks_mediapipe`.
-    *   **(Sub-step 3 - Conditional)** If landmarks detected:
-        *   **(Parallel Sub-step 3.1)** Extract pixel coordinates.
-        *   **(Parallel Sub-step 3.2)** Define ROI Bounding Boxes.
-        *   **(Parallel Sub-step 3.3)** Extract ROI frame using `extract_roi_frame`.
-        *   **(Parallel Sub-step 3.4)** **Standardize ROI:** If extraction successful, resize ROI to `ROI_SIZE` using `cv2.resize(..., interpolation=cv2.INTER_AREA)`. Store result in `current_..._roi` (or `None` if extraction/resizing failed).
-        *   **(Parallel Sub-step 3.5 - Conditional Incremental Feature Extraction)** For each ROI type:
-            *   Check if *both* `prev_..._roi` and `current_..._roi` are valid.
-            *   Calculate temporal difference: `diff_frame = current_roi - prev_roi` (float32).
-            *   Call `extract_wavelet_features_from_diff(diff_frame)`.
-            *   If valid feature vector `fv` returned, append to `..._feature_vectors` list.
-        *   **(Parallel Sub-step 3.6 - Update Previous ROIs)** Update `prev_..._roi = current_..._roi` (storing the *standardized* ROI or `None`).
-        *   **(Parallel Sub-step 3.7 - Visualization)** Draw landmarks and *original* ROI boxes on `display_frame`.
-    *   **(Sub-step 4 - Conditional Reset)** If no landmarks detected, reset `prev_..._roi` variables to `None`.
-    *   **(Sub-step 5 - Visualization)** Display `display_frame`.
-    *   **(Sub-step 6)** Check for quit key.
+    *   **(Sub-step 2)** Initialize `current_roi_k = None`, `current_block_fv_k = None`, `wavelet_fv_k = None` for all ROIs `k`.
+    *   **(Sub-step 3)** **Detect Landmarks:** `detect_face_and_landmarks_mediapipe(frame(t), timestamp_ms)`. If no detection, reset `prev_roi_k` and `prev_block_fv_k` to `None`, skip to Sub-step 8.
+    *   **(Sub-step 4 - Conditional)** If landmarks detected:
+        *   **(Parallel Sub-step 4.1)** Extract pixel coordinates `landmarks_px(t)`.
+        *   **(Parallel Sub-step 4.2 - ROI Extraction & Standardization)** For each ROI `k`:
+            *   Define bounding box `bbox_k(t)` (using `get_bounding_box`).
+            *   (*Alternative Rejected: Use `cv2.convexHull` + masking instead of simple bounding box.*)
+            *   Extract `roi_raw_k(t)` using `extract_roi_frame`.
+            *   If valid, resize to `ROI_SIZE` -> `current_roi_k(t)` (float32). Else `current_roi_k(t) = None`.
+        *   **(Parallel Sub-step 4.3 - Feature Calculation)** For each ROI `k`:
+            *   **Path A (Wavelet FV):**
+                *   Check if `current_roi_k(t)` and `prev_roi_k` (from `t-1`) are valid.
+                *   Calculate `diff_k(t) = current_roi_k(t) - prev_roi_k`.
+                *   Call `extract_wavelet_features_from_diff(diff_k(t))` -> `wavelet_fv_k(t)` (or `None`).
+            *   **Path B (Block FV):**
+                *   Check if `current_roi_k(t)` is valid.
+                *   Apply MSR: `msr_k(t) = apply_msr(current_roi_k(t))`.
+                *   If valid, fuse: `fused_k(t) = fuse_rgb_msr(current_roi_k(t), msr_k(t))`.
+                *   If valid, extract block features: `current_block_fv_k(t) = extract_block_features(fused_k(t))` (or `None`).
+                *   Else (if MSR/Fuse/Extract fails), `current_block_fv_k(t) = None`.
+        *   **(Parallel Sub-step 4.4 - Feature Combination)** For each ROI `k`:
+            *   Check if `wavelet_fv_k(t)` (from diff `t-1` to `t`) and `prev_block_fv_k` (block features from frame `t-1`) are both valid (`!= None`).
+            *   Concatenate: `combined_fv_k(t) = np.concatenate((wavelet_fv_k(t), prev_block_fv_k))`.
+            *   Append `combined_fv_k(t)` to `combined_..._features` list for ROI `k`.
+        *   **(Parallel Sub-step 4.5 - Visualization)** Draw landmarks and *original* ROI boxes on `display_frame`.
+    *   **(Sub-step 5 - Conditional Reset)** If no landmarks were detected in Sub-step 3, ensure `current_roi_k` and `current_block_fv_k` are `None`.
+    *   **(Sub-step 6 - Visualization)** If `VISUALIZE`, display `display_frame`.
+    *   **(Sub-step 7)** Check for quit key.
+    *   **(Sub-step 8 - Update Previous State)** For each ROI `k`:
+        *   `prev_roi_k = current_roi_k(t)`.
+        *   `prev_block_fv_k = current_block_fv_k(t)`.
 4.  **(Consecutive)** **Post-Loop Processing:**
-    *   Print number of feature vectors collected.
-    *   **(Conditional STI Construction)** For each ROI type:
-        *   If the corresponding `..._feature_vectors` list is not empty:
-            *   Call `construct_and_resize_sti(..._feature_vectors, target_size=final_sti_size)`.
-            *   Store the resulting 224x224 STI (e.g., `forehead_sti`).
+    *   Print number of combined feature vectors collected per ROI.
+    *   **(Conditional Combined STI Construction)** For each ROI `k`:
+        *   If the corresponding `combined_..._features` list is not empty:
+            *   Stack vectors: `STI_k = np.vstack(combined_..._features)`.
+            *   Resize: `final_STI_k = construct_and_resize_sti(STI_k, target_size=final_sti_size)`.
+            *   Store the resulting 224x224 combined STI (e.g., `forehead_sti`).
             *   Print status/shape of constructed STI.
-            *   **(Optional)** Visualize STI.
+            *   **(Optional)** If `VISUALIZE`, display `final_STI_k`.
     *   **(Cleanup)** Optionally delete temporary `_30fps.mp4` file.
 
 ### II.B. Image Processing Path (`elif is_image:`)
@@ -62,10 +85,10 @@ Spatio-Temporal Images (STIs).
     *   Extract coordinates, define ROIs.
     *   Extract ROI frame.
     *   **Standardize ROI:** Resize extracted ROI to `ROI_SIZE`.
-    *   Append the *standardized* single ROI frame to the image-specific sequence list (e.g., `forehead_roi_sequence`).
+    *   Append the *standardized* single ROI frame to the image-specific sequence list (e.g., `single_image_forehead_roi`).
     *   Draw landmarks/ROI boxes.
 4.  **(Consecutive - Visualization)** Display image, wait for key.
-5.  **(Consecutive)** Print number of standardized ROIs extracted (0 or 1). STIs are not generated.
+5.  **(Consecutive)** Print status. Combined STIs are not generated.
 
 ### II.C. Unsupported File Type Path (`else:`)
 
@@ -73,13 +96,44 @@ Spatio-Temporal Images (STIs).
 
 ## III. Cleanup (`finally` block)
 
-1.  Release Video Capture.
-2.  Destroy Windows.
-3.  Close Landmarker.
+1.  Release Video Capture (`cap.release()`).
+2.  Destroy OpenCV Windows (`cv2.destroyAllWindows()`).
+3.  Close MediaPipe Landmarker (`face_landmarker.close()`).
 
 ## IV. Outputs (Available after script execution)
 
-*   **(For Videos)** **Spatio-Temporal Images (NumPy arrays):** `forehead_sti`, `left_cheek_sti`, `right_cheek_sti`. These are the 224x224 images ready for CNN input (Path A).
-*   **(For Single Images Only)** **Standardized ROI Sequences (Lists of NumPy arrays):** `forehead_roi_sequence`, etc. Contain the single *standardized* extracted ROI frame.
-*   **Visualizations:** Displayed windows.
+*   **(For Videos)** **Combined Spatio-Temporal Images (NumPy arrays):** `forehead_sti`, `left_cheek_sti`, `right_cheek_sti`. These are the 224x224 images derived from concatenated wavelet (temporal) and block (spatial/illumination-robust) features, ready for CNN input.
+*   **(For Single Images Only)** **Standardized ROI Sequences (Lists of NumPy arrays):** `single_image_forehead_roi`, etc. Contain the single *standardized* extracted ROI frame.
+*   **Visualizations:** Displayed windows (if `VISUALIZE` is enabled).
 *   **(Potentially)** The converted `_30fps.mp4` file.
+
+## V. Next Steps (Requires separate scripts/modules)
+
+1.  **CNN Model Definition (`model.py`)** [DONE]
+    *   Instantiates the `Enhanced_HR_CNN` class, which uses a modified ResNet18 backbone, attention, multi-scale features, and an MLP head.
+    *   Accepts 3-channel, 224x224 stacked STIs as input.
+    *   Outputs a single HR value.
+    *   Includes custom `HREstimationLoss` and `HR_Trainer` class with augmentations, LR scheduling, etc.
+2.  **Data Preprocessing for Training Dataset** [TODO]
+    *   Requires a script to iterate through a chosen dataset (e.g., PURE, UBFC).
+    *   Apply windowing (e.g., 5s segments) to video and ground truth signals.
+    *   Run `preprocessing.py` logic on each video segment to generate the 3 individual STIs.
+    *   Stack the 3 STIs into a single `(3, 224, 224)` array.
+    *   Calculate the ground truth HR for the segment.
+    *   Save the stacked STI (e.g., `.npy`) and its label systematically.
+3.  **Training Script (`train.py` or Colab Notebook)** [TODO]
+    *   Implement PyTorch `Dataset` to load saved stacked STIs and labels.
+    *   Create `DataLoader`s for training and validation sets.
+    *   Initialize `Enhanced_HR_CNN`, `HREstimationLoss` (or use default from trainer), `AdamW` optimizer.
+    *   Instantiate and use the `HR_Trainer` from `model.py` within an epoch loop.
+    *   Implement model saving (checkpoints, best model).
+    *   (Optional) Implement k-fold cross-validation logic.
+    *   (Optional) Implement early stopping.
+4.  **Inference Script (`predict.py` or similar)** [TODO]
+    *   Load the trained model weights (`.pth` file) into an `Enhanced_HR_CNN` instance.
+    *   Take a video input path via arguments.
+    *   Run `preprocessing.py` logic (including stacking) on the *entire* video (or segments if doing windowed prediction) to get `stacked_input_sti`.
+    *   Convert `stacked_input_sti` to a PyTorch tensor, add batch dim, send to device.
+    *   Feed tensor to the loaded model in `eval()` mode to get raw HR prediction(s).
+    *   Apply post-processing (smoothing, filtering) [TODO].
+    *   Output final HR estimate(s).

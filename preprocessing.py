@@ -2,10 +2,16 @@ import cv2
 import numpy as np
 import mediapipe as mp
 import os # Added for path checking
+import argparse # Add argparse import
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 from mediapipe.framework.formats import landmark_pb2 # Import protobuf format
-from feature_extraction import extract_wavelet_features_from_diff, construct_and_resize_sti # Remove calculate_temporal_difference
+# Import solutions module for drawing utils etc.
+import mediapipe.python.solutions as mp_solutions
+from feature_extraction import (
+    extract_wavelet_features_from_diff, construct_and_resize_sti, # Path A
+    apply_msr, fuse_rgb_msr, extract_block_features # Path B
+)
 
 # --- MediaPipe Setup ---
 # Standard aliases for MediaPipe Task API components
@@ -295,40 +301,45 @@ def convert_video_to_30fps(input_video_path, output_video_path):
     return True
 
 
-# --- Example Usage (Updated for MediaPipe) ---
+# --- Example Usage (Updated for Combined Features) ---
 # This block demonstrates how to use the functions above for either
 # a single image or a video file.
 if __name__ == '__main__':
+    # --- Argument Parser Setup ---
+    parser = argparse.ArgumentParser(description="Preprocess facial video/image for HR estimation: detect landmarks, extract ROIs, combine features (Wavelet Diff + Block Avg), and create final STI.")
+    parser.add_argument('-i', '--input', required=True, help="Path to the input video or image file.")
+    parser.add_argument('--visualize', action='store_true', help="Enable visualization of processed frames and STIs.") # Add optional visualize flag
+    args = parser.parse_args()
+
     # --- Configuration ---
-    # Change this to your input image or video file
-    INPUT_SOURCE = 'test/sn.png' # Example: Can be .png, .jpg, .mp4, .avi etc.
+    # Use the input from command line
+    INPUT_SOURCE = args.input
     # Target FPS for video processing and timestamp calculation
     TARGET_FPS = 30.0
     # Supported file extensions
     VIDEO_EXTENSIONS = ['.mp4', '.avi', '.mov', '.mkv']
     IMAGE_EXTENSIONS = ['.png', '.jpg', '.jpeg', '.bmp', '.tiff']
-    # Control visualization
-    VISUALIZE = True # Set to False to disable visualizations
+    # Control visualization based on command line flag
+    VISUALIZE = args.visualize # Use the parsed argument
     # --- End Configuration ---
 
     # ROI Standardization size (Width, Height) - Defined globally or here
     standard_roi_size = ROI_SIZE # Use the global constant
+    final_sti_size = (224, 224) # Target size for CNN input
 
     cap = None # Initialize video capture object outside loop
-    # Store feature vectors instead of full frames
-    forehead_feature_vectors = [] 
-    left_cheek_feature_vectors = []
-    right_cheek_feature_vectors = []
-    
-    # Variables to store the previous frame's ROI for diff calculation
+    # Store combined feature vectors
+    combined_forehead_features = []
+    combined_left_cheek_features = []
+    combined_right_cheek_features = []
+
+    # Variables to store previous frame's state for feature calculation
     prev_forehead_roi = None
     prev_left_cheek_roi = None
     prev_right_cheek_roi = None
-
-    # Store standardized ROIs from the single image case
-    single_image_forehead_roi = [] 
-    single_image_left_cheek_roi = []
-    single_image_right_cheek_roi = []
+    prev_block_features_forehead = None
+    prev_block_features_left_cheek = None
+    prev_block_features_right_cheek = None
 
     try:
         # --- Input Type Handling ---
@@ -371,22 +382,26 @@ if __name__ == '__main__':
                 current_forehead_roi = None # Reset current ROIs for this frame
                 current_left_cheek = None
                 current_right_cheek = None
+                block_features_forehead = None # Reset current block features
+                block_features_left_cheek = None
+                block_features_right_cheek = None
+                forehead_fv = None # Reset current wavelet features
+                left_cheek_fv = None
+                right_cheek_fv = None
 
                 detection_result = detect_face_and_landmarks_mediapipe(frame, timestamp_ms)
 
                 if detection_result:
                     landmarks_coords = extract_landmarks_coordinates_mediapipe(detection_result, frame.shape)
                     if landmarks_coords is not None:
-                        # --- Define ROIs --- 
+                        # --- Define, Extract & Standardize ROIs --- 
                         roi_forehead_bbox = define_roi_forehead_mediapipe(landmarks_coords)
                         roi_left_cheek_bbox, roi_right_cheek_bbox = define_roi_cheeks_mediapipe(landmarks_coords)
 
-                        # --- Extract & Standardize ROIs --- 
                         if roi_forehead_bbox:
                             extracted_forehead = extract_roi_frame(frame, roi_forehead_bbox)
                             if extracted_forehead is not None and extracted_forehead.size > 0:
                                 current_forehead_roi = cv2.resize(extracted_forehead, standard_roi_size, interpolation=cv2.INTER_AREA)
-                                # Draw bbox on display frame
                                 x, y, w, h = roi_forehead_bbox
                                 cv2.rectangle(display_frame, (x, y), (x + w, y + h), (255, 0, 0), 1)
                             else:
@@ -398,7 +413,6 @@ if __name__ == '__main__':
                             extracted_left_cheek = extract_roi_frame(frame, roi_left_cheek_bbox)
                             if extracted_left_cheek is not None and extracted_left_cheek.size > 0: 
                                 current_left_cheek = cv2.resize(extracted_left_cheek, standard_roi_size, interpolation=cv2.INTER_AREA)
-                                # Draw bbox on display frame
                                 x, y, w, h = roi_left_cheek_bbox
                                 cv2.rectangle(display_frame, (x, y), (x + w, y + h), (0, 0, 255), 1)
                             else:
@@ -410,7 +424,6 @@ if __name__ == '__main__':
                             extracted_right_cheek = extract_roi_frame(frame, roi_right_cheek_bbox)
                             if extracted_right_cheek is not None and extracted_right_cheek.size > 0: 
                                 current_right_cheek = cv2.resize(extracted_right_cheek, standard_roi_size, interpolation=cv2.INTER_AREA)
-                                # Draw bbox on display frame
                                 x, y, w, h = roi_right_cheek_bbox
                                 cv2.rectangle(display_frame, (x, y), (x + w, y + h), (0, 255, 255), 1)
                             else:
@@ -418,55 +431,85 @@ if __name__ == '__main__':
                         else:
                             current_right_cheek = None
 
-                        # --- Incremental Feature Extraction --- 
-                        # Forehead
+                        # --- PATH A: Calculate Wavelet Features (from t-1 to t) --- 
                         if prev_forehead_roi is not None and current_forehead_roi is not None:
-                            # Shape check is no longer needed due to standardization
                             diff_forehead = current_forehead_roi.astype(np.float32) - prev_forehead_roi.astype(np.float32)
-                            forehead_fv = extract_wavelet_features_from_diff(diff_forehead) # Use the new function
-                            if forehead_fv is not None:
-                                forehead_feature_vectors.append(forehead_fv)
+                            forehead_fv = extract_wavelet_features_from_diff(diff_forehead)
                         
-                        # Left Cheek
                         if prev_left_cheek_roi is not None and current_left_cheek is not None:
                            diff_left_cheek = current_left_cheek.astype(np.float32) - prev_left_cheek_roi.astype(np.float32)
                            left_cheek_fv = extract_wavelet_features_from_diff(diff_left_cheek)
-                           if left_cheek_fv is not None:
-                               left_cheek_feature_vectors.append(left_cheek_fv)
                            
-                        # Right Cheek
                         if prev_right_cheek_roi is not None and current_right_cheek is not None:
                            diff_right_cheek = current_right_cheek.astype(np.float32) - prev_right_cheek_roi.astype(np.float32)
                            right_cheek_fv = extract_wavelet_features_from_diff(diff_right_cheek)
-                           if right_cheek_fv is not None:
-                               right_cheek_feature_vectors.append(right_cheek_fv)
-                           
 
-                        # --- Update previous ROIs for next iteration --- 
-                        prev_forehead_roi = current_forehead_roi # Store the standardized ROI (or None)
-                        prev_left_cheek_roi = current_left_cheek
-                        prev_right_cheek_roi = current_right_cheek
+                        # --- PATH B: Calculate Block Features (for current frame t) --- 
+                        if current_forehead_roi is not None:
+                            msr_forehead = apply_msr(current_forehead_roi)
+                            if msr_forehead is not None:
+                                fused_forehead = fuse_rgb_msr(current_forehead_roi, msr_forehead)
+                                if fused_forehead is not None:
+                                    block_features_forehead = extract_block_features(fused_forehead)
                         
-                        # --- Draw Landmarks (moved after potential ROI updates) --- 
+                        if current_left_cheek is not None:
+                            msr_left_cheek = apply_msr(current_left_cheek)
+                            if msr_left_cheek is not None:
+                                fused_left_cheek = fuse_rgb_msr(current_left_cheek, msr_left_cheek)
+                                if fused_left_cheek is not None:
+                                    block_features_left_cheek = extract_block_features(fused_left_cheek)
+                        
+                        if current_right_cheek is not None:
+                            msr_right_cheek = apply_msr(current_right_cheek)
+                            if msr_right_cheek is not None:
+                                fused_right_cheek = fuse_rgb_msr(current_right_cheek, msr_right_cheek)
+                                if fused_right_cheek is not None:
+                                    block_features_right_cheek = extract_block_features(fused_right_cheek)
+
+                        # --- FEATURE COMBINATION (Concatenate Path A[t-1:t] & Path B[t-1]) --- 
+                        if forehead_fv is not None and prev_block_features_forehead is not None:
+                            combined_fv = np.concatenate((forehead_fv, prev_block_features_forehead))
+                            combined_forehead_features.append(combined_fv)
+                        
+                        if left_cheek_fv is not None and prev_block_features_left_cheek is not None:
+                            combined_fv = np.concatenate((left_cheek_fv, prev_block_features_left_cheek))
+                            combined_left_cheek_features.append(combined_fv)
+                        
+                        if right_cheek_fv is not None and prev_block_features_right_cheek is not None:
+                            combined_fv = np.concatenate((right_cheek_fv, prev_block_features_right_cheek))
+                            combined_right_cheek_features.append(combined_fv)
+
+                        # --- Draw Landmarks --- 
                         proto_landmarks = landmark_pb2.NormalizedLandmarkList()
                         for landmark_dataclass in detection_result.face_landmarks[0]:
                             landmark_proto = landmark_pb2.NormalizedLandmark(
                                 x=landmark_dataclass.x, y=landmark_dataclass.y, z=landmark_dataclass.z
                             )
                             proto_landmarks.landmark.append(landmark_proto)
-                        mp.solutions.drawing_utils.draw_landmarks(
+                        # Use mp_solutions for drawing
+                        mp_solutions.drawing_utils.draw_landmarks(
                             image=display_frame,
                             landmark_list=proto_landmarks,
-                            connections=mp.solutions.face_mesh.FACEMESH_TESSELATION,
+                            connections=mp_solutions.face_mesh.FACEMESH_TESSELATION,
                             landmark_drawing_spec=None,
-                            connection_drawing_spec=mp.solutions.drawing_styles.get_default_face_mesh_tesselation_style()
+                            connection_drawing_spec=mp_solutions.drawing_styles.get_default_face_mesh_tesselation_style()
                         )
                 else: 
-                    # If no face detected, reset previous ROIs to avoid calculating diff across gaps
-                    prev_forehead_roi = None
-                    prev_left_cheek_roi = None
-                    prev_right_cheek_roi = None
+                    # If no face detected, reset previous ROIs and block features to avoid combination across gaps
+                    current_forehead_roi = None # Ensure current are None if no detection
+                    current_left_cheek = None
+                    current_right_cheek = None
+                    block_features_forehead = None 
+                    block_features_left_cheek = None
+                    block_features_right_cheek = None
                 
+                # --- Update Previous State for next iteration --- 
+                prev_forehead_roi = current_forehead_roi
+                prev_left_cheek_roi = current_left_cheek
+                prev_right_cheek_roi = current_right_cheek
+                prev_block_features_forehead = block_features_forehead
+                prev_block_features_left_cheek = block_features_left_cheek
+                prev_block_features_right_cheek = block_features_right_cheek
                 # --- End frame processing --- 
                 
                 # Display the processed frame if visualize is True
@@ -482,48 +525,52 @@ if __name__ == '__main__':
                 frame_index += 1
                 
             # --- After video processing loop --- 
-            # Print the number of *feature vectors* collected
-            print(f"\nFinished processing video. Collected {len(forehead_feature_vectors)} forehead feature vectors.")
-            print(f"Collected {len(left_cheek_feature_vectors)} left cheek feature vectors.")
-            print(f"Collected {len(right_cheek_feature_vectors)} right cheek feature vectors.")
+            print(f"\nFinished processing video.")
+            print(f"Collected {len(combined_forehead_features)} combined forehead feature vectors.")
+            print(f"Collected {len(combined_left_cheek_features)} combined left cheek feature vectors.")
+            print(f"Collected {len(combined_right_cheek_features)} combined right cheek feature vectors.")
             
-            # --- Construct and Resize STIs --- 
-            final_sti_size = (224, 224) # Target size for CNN input as per plan
+            # --- Construct Final Combined STIs --- 
             forehead_sti = None
             left_cheek_sti = None
             right_cheek_sti = None
             
-            if forehead_feature_vectors:
-                 print(f"Shape of first forehead feature vector: {forehead_feature_vectors[0].shape}")
-                 forehead_sti = construct_and_resize_sti(forehead_feature_vectors, target_size=final_sti_size)
+            if combined_forehead_features:
+                 print(f"Shape of first combined forehead feature vector: {combined_forehead_features[0].shape}")
+                 forehead_sti = construct_and_resize_sti(combined_forehead_features, target_size=final_sti_size)
                  if forehead_sti is not None:
-                     print(f"Constructed Forehead STI with shape: {forehead_sti.shape}")
-                     # Optional: Visualize or save the STI
+                     print(f"Constructed Combined Forehead STI with shape: {forehead_sti.shape}")
                      if VISUALIZE:
-                         cv2.imshow("Forehead STI", cv2.normalize(forehead_sti, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8))
+                         # Cast normalized STI to uint8 for display
+                         cv2.imshow("Combined Forehead STI", cv2.normalize(forehead_sti, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8))
                  else:
-                     print("Failed to construct Forehead STI.")
+                     print("Failed to construct Combined Forehead STI.")
             
-            if left_cheek_feature_vectors:
-                 left_cheek_sti = construct_and_resize_sti(left_cheek_feature_vectors, target_size=final_sti_size)
+            if combined_left_cheek_features:
+                 print(f"Shape of first combined left cheek feature vector: {combined_left_cheek_features[0].shape}")
+                 left_cheek_sti = construct_and_resize_sti(combined_left_cheek_features, target_size=final_sti_size)
                  if left_cheek_sti is not None:
-                     print(f"Constructed Left Cheek STI with shape: {left_cheek_sti.shape}")
+                     print(f"Constructed Combined Left Cheek STI with shape: {left_cheek_sti.shape}")
                      if VISUALIZE:
-                         cv2.imshow("Left Cheek STI", cv2.normalize(left_cheek_sti, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8))
+                         # Cast normalized STI to uint8 for display
+                         cv2.imshow("Combined Left Cheek STI", cv2.normalize(left_cheek_sti, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8))
                  else:
-                     print("Failed to construct Left Cheek STI.")
+                     print("Failed to construct Combined Left Cheek STI.")
                      
-            if right_cheek_feature_vectors:
-                 right_cheek_sti = construct_and_resize_sti(right_cheek_feature_vectors, target_size=final_sti_size)
+            if combined_right_cheek_features:
+                 print(f"Shape of first combined right cheek feature vector: {combined_right_cheek_features[0].shape}")
+                 right_cheek_sti = construct_and_resize_sti(combined_right_cheek_features, target_size=final_sti_size)
                  if right_cheek_sti is not None:
-                     print(f"Constructed Right Cheek STI with shape: {right_cheek_sti.shape}")
+                     print(f"Constructed Combined Right Cheek STI with shape: {right_cheek_sti.shape}")
                      if VISUALIZE:
-                         cv2.imshow("Right Cheek STI", cv2.normalize(right_cheek_sti, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8))
+                         # Cast normalized STI to uint8 for display
+                         cv2.imshow("Combined Right Cheek STI", cv2.normalize(right_cheek_sti, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8))
                  else:
-                     print("Failed to construct Right Cheek STI.")
-            
-            # Now the variables forehead_sti, left_cheek_sti, right_cheek_sti hold the 
-            # final 224x224 images ready for input to a CNN (Path A).
+                     print("Failed to construct Combined Right Cheek STI.")
+
+            # The variables forehead_sti, left_cheek_sti, right_cheek_sti now hold the 
+            # final 224x224 combined STIs ready for input to the CNN.
+
             # Add a final wait key if any STIs were displayed and visualization is enabled
             if VISUALIZE and (forehead_sti is not None or left_cheek_sti is not None or right_cheek_sti is not None):
                print("Press any key in an OpenCV window to close STI windows and continue...")
@@ -536,10 +583,20 @@ if __name__ == '__main__':
             except OSError as e:
                 print(f"Error removing temporary file {converted_video_path}: {e}")
 
+            # --- Stack STIs for 3-Channel Input --- 
+            stacked_input_sti = None # Initialize
+            if forehead_sti is not None and left_cheek_sti is not None and right_cheek_sti is not None:
+                # Stack along a new first dimension (channel dimension)
+                stacked_input_sti = np.stack([forehead_sti, left_cheek_sti, right_cheek_sti], axis=0)
+                print(f"\nSuccessfully stacked STIs. Shape for model input: {stacked_input_sti.shape}")
+                # This stacked_input_sti (NumPy array, shape (3, 224, 224)) is ready 
+                # to be converted to a PyTorch tensor for the Enhanced_HR_CNN.
+            else:
+                print("\nWarning: One or more ROIs failed processing. Cannot create stacked 3-channel STI.")
 
         elif is_image:
             # --- Single Image Processing Logic --- 
-            # (Feature extraction doesn't apply here as there's no temporal difference)
+            # (Feature extraction/combination doesn't apply here)
             print(f"Processing image file: {INPUT_SOURCE}")
             frame = cv2.imread(INPUT_SOURCE)
             if frame is None:
@@ -564,7 +621,6 @@ if __name__ == '__main__':
                         if extracted_forehead is not None and extracted_forehead.size > 0: 
                             # Resize the single image ROI as well for consistency if needed later
                             standardized_forehead_roi = cv2.resize(extracted_forehead, standard_roi_size, interpolation=cv2.INTER_AREA)
-                            single_image_forehead_roi.append(standardized_forehead_roi) # Use new name
                             print(f"Extracted Standardized Forehead ROI: Shape={standardized_forehead_roi.shape}, dtype={standardized_forehead_roi.dtype}")
                             x, y, w, h = roi_forehead_bbox
                             cv2.rectangle(display_frame, (x, y), (x + w, y + h), (255, 0, 0), 1) 
@@ -577,7 +633,6 @@ if __name__ == '__main__':
                         extracted_left_cheek = extract_roi_frame(frame, roi_left_cheek_bbox)
                         if extracted_left_cheek is not None and extracted_left_cheek.size > 0:
                             standardized_left_cheek = cv2.resize(extracted_left_cheek, standard_roi_size, interpolation=cv2.INTER_AREA)
-                            single_image_left_cheek_roi.append(standardized_left_cheek) # Use new name
                             print(f"Extracted Standardized Left Cheek ROI: Shape={standardized_left_cheek.shape}, dtype={standardized_left_cheek.dtype}")
                             # Draw on display frame
                             x, y, w, h = roi_left_cheek_bbox
@@ -588,7 +643,6 @@ if __name__ == '__main__':
                         extracted_right_cheek = extract_roi_frame(frame, roi_right_cheek_bbox)
                         if extracted_right_cheek is not None and extracted_right_cheek.size > 0: 
                             standardized_right_cheek = cv2.resize(extracted_right_cheek, standard_roi_size, interpolation=cv2.INTER_AREA)
-                            single_image_right_cheek_roi.append(standardized_right_cheek) # Use new name
                             print(f"Extracted Standardized Right Cheek ROI: Shape={standardized_right_cheek.shape}, dtype={standardized_right_cheek.dtype}")
                             # Draw on display frame
                             x, y, w, h = roi_right_cheek_bbox
@@ -603,12 +657,13 @@ if __name__ == '__main__':
                             x=landmark_dataclass.x, y=landmark_dataclass.y, z=landmark_dataclass.z
                         )
                         proto_landmarks.landmark.append(landmark_proto)
-                    mp.solutions.drawing_utils.draw_landmarks(
+                    # Use mp_solutions for drawing
+                    mp_solutions.drawing_utils.draw_landmarks(
                         image=display_frame,
                         landmark_list=proto_landmarks, 
-                        connections=mp.solutions.face_mesh.FACEMESH_TESSELATION, 
+                        connections=mp_solutions.face_mesh.FACEMESH_TESSELATION, 
                         landmark_drawing_spec=None, 
-                        connection_drawing_spec=mp.solutions.drawing_styles.get_default_face_mesh_tesselation_style())
+                        connection_drawing_spec=mp_solutions.drawing_styles.get_default_face_mesh_tesselation_style())
                 else:
                     print("Could not extract landmark coordinates.")
             else:
@@ -621,7 +676,7 @@ if __name__ == '__main__':
                 cv2.waitKey(0) # Wait indefinitely until a key is pressed
             
              # Consolidated check - print only if no ROIs extracted at all (still relevant for images)
-            if not single_image_forehead_roi and not single_image_left_cheek_roi and not single_image_right_cheek_roi: # Use new names
+            if not roi_forehead_bbox and not roi_left_cheek_bbox and not roi_right_cheek_bbox: # Use new names
                   print("No ROIs extracted from image.")
 
         else:

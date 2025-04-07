@@ -142,3 +142,6 @@
     - Root Mean Square Error (RMSE)
     - Mean Error Rate (MER): `mean(|predicted_HR - actual_HR| / actual_HR)`
     - Pearson Correlation Coefficient (ρ) between predicted and actual HR sequences.
+
+
+2d dwt and then projections ans Construction might not be accurate as we get very low values of points 

@@ -340,6 +340,7 @@ if __name__ == '__main__':
     prev_block_features_forehead = None
     prev_block_features_left_cheek = None
     prev_block_features_right_cheek = None
+    converted_video_path = None # Initialize path variable outside the try block
 
     try:
         # --- Input Type Handling ---
@@ -353,11 +354,10 @@ if __name__ == '__main__':
             # Prepare path for converted video
             base_name = os.path.splitext(os.path.basename(INPUT_SOURCE))[0]
             output_dir = os.path.dirname(INPUT_SOURCE) or '.'
+            # Assign the path to the variable defined outside the try block
             converted_video_path = os.path.join(output_dir, f"{base_name}_30fps.mp4")
 
-            # Convert video to 30 FPS if necessary
-            # Note: We might want to skip conversion if original FPS is already 30?
-            # For simplicity now, we always convert to ensure exact 30 FPS timestamps.
+            # Convert video to 30 FPS
             if not convert_video_to_30fps(INPUT_SOURCE, converted_video_path):
                  raise RuntimeError("Video conversion failed.") # Stop if conversion fails
 
@@ -576,13 +576,6 @@ if __name__ == '__main__':
                print("Press any key in an OpenCV window to close STI windows and continue...")
                cv2.waitKey(0)
 
-            # Optional: Clean up the converted video file
-            try:
-                os.remove(converted_video_path)
-                print(f"Removed temporary file: {converted_video_path}")
-            except OSError as e:
-                print(f"Error removing temporary file {converted_video_path}: {e}")
-
             # --- Stack STIs for 3-Channel Input --- 
             stacked_input_sti = None # Initialize
             if forehead_sti is not None and left_cheek_sti is not None and right_cheek_sti is not None:
@@ -702,5 +695,18 @@ if __name__ == '__main__':
             cap.release() # Release video capture object
         cv2.destroyAllWindows() # Close all OpenCV windows
         if face_landmarker:
-            face_landmarker.close() # Close the MediaPipe landmarker
-            print("MediaPipe FaceLandmarker closed.")
+            try: # Add try-except for robustness during close
+                 face_landmarker.close() # Close the MediaPipe landmarker
+                 print("MediaPipe FaceLandmarker closed.")
+            except Exception as close_err:
+                 print(f"Error closing MediaPipe FaceLandmarker: {close_err}")
+
+        # ADD Cleanup for temporary file here:
+        # Only attempt removal if it's a video path and the path exists
+        if converted_video_path and os.path.exists(converted_video_path):
+            try:
+                os.remove(converted_video_path)
+                print(f"Removed temporary file: {converted_video_path}")
+            except OSError as e:
+                # Log error but don't crash the cleanup process
+                print(f"Error removing temporary file {converted_video_path}: {e}")

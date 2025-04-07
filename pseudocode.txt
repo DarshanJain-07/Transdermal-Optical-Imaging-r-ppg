@@ -1,0 +1,619 @@
+// --- Global Constants & Initialization ---
+DEFINE ROI_SIZE = (64, 64)          // Target (Width, Height) for standardized ROIs
+DEFINE STI_SIZE = (224, 224)        // Target (Width, Height) for final STIs for CNN
+DEFINE TARGET_FPS = 30.0            // Frames per second for video processing
+DEFINE FACE_MODEL_PATH = "face_landmarker_v2_with_blendshapes.task"
+DEFINE LANDMARK_INDICES = { // Simplified representation
+    "FOREHEAD": [idx1, idx2, ...],
+    "LEFT_CHEEK": [idxA, idxB, ...],
+    "RIGHT_CHEEK": [idxX, idxY, ...]
+}
+
+// Initialize Face Landmarker (requires a CV/ML library)
+face_landmarker = InitializeFaceLandmarker(
+    model_path = FACE_MODEL_PATH,
+    mode = "VIDEO",
+    num_faces = 1,
+    min_detection_confidence = 0.85,
+    min_presence_confidence = 0.85,
+    min_tracking_confidence = 0.85
+)
+
+// --- Main Algorithm Entry Point ---
+FUNCTION Main(input_path : String, visualize : Boolean)
+
+    // --- Initialization ---
+    combined_features_forehead = New List()
+    combined_features_left_cheek = New List()
+    combined_features_right_cheek = New List()
+
+    prev_roi_forehead = NULL
+    prev_roi_left_cheek = NULL
+    prev_roi_right_cheek = NULL
+
+    prev_block_fv_forehead = NULL
+    prev_block_fv_left_cheek = NULL
+    prev_block_fv_right_cheek = NULL
+
+    converted_video_path = NULL // Path for temporary 30fps video
+
+    // --- Input Handling ---
+    file_extension = GetFileExtension(input_path)
+    is_video = CheckIfVideoExtension(file_extension)
+    is_image = CheckIfImageExtension(file_extension)
+
+    TRY
+        IF is_video THEN
+            // --- Video Processing Path ---
+            Print("Processing video...")
+            converted_video_path = GenerateOutputPath(input_path, "_30fps.mp4")
+
+            success = ConvertVideoFPS(input_path, converted_video_path, TARGET_FPS)
+            IF NOT success THEN THROW Error("Video conversion failed")
+
+            video_capture = OpenVideo(converted_video_path)
+            IF NOT IsVideoOpen(video_capture) THEN THROW Error("Cannot open video")
+
+            frame_index = 0
+            WHILE TRUE DO
+                frame = ReadFrame(video_capture) // Returns Image[H, W, 3] (e.g., BGR)
+                IF frame IS NULL THEN BREAK // End of video
+
+                timestamp_ms = Integer(frame_index * (1000.0 / TARGET_FPS))
+                display_frame = Copy(frame) // For visualization
+
+                // Reset frame-specific variables
+                current_roi_forehead = NULL
+                current_roi_left_cheek = NULL
+                current_roi_right_cheek = NULL
+                block_fv_forehead = NULL
+                block_fv_left_cheek = NULL
+                block_fv_right_cheek = NULL
+                wavelet_fv_forehead = NULL
+                wavelet_fv_left_cheek = NULL
+                wavelet_fv_right_cheek = NULL
+
+                // --- Face & Landmark Detection ---
+                detection_result = face_landmarker.DetectForVideo(frame, timestamp_ms)
+
+                IF detection_result AND HasLandmarks(detection_result) THEN
+                    landmarks_normalized = GetLandmarks(detection_result, index=0) // Assuming 1 face
+                    frame_height, frame_width = GetImageDimensions(frame)
+                    landmarks_px = DenormalizeLandmarks(landmarks_normalized, frame_width, frame_height) // Matrix[478, 2]
+
+                    // --- ROI Extraction & Standardization ---
+                    // Forehead
+                    landmarks_forehead_px = SelectRows(landmarks_px, LANDMARK_INDICES["FOREHEAD"])
+                    bbox_forehead = GetBoundingBox(landmarks_forehead_px) // (x, y, w, h)
+                    IF bbox_forehead IS NOT NULL THEN
+                        roi_raw_forehead = ExtractROI(frame, bbox_forehead)
+                        IF IsValidImage(roi_raw_forehead) THEN
+                           current_roi_forehead = CV.Resize(roi_raw_forehead, ROI_SIZE, interpolation="AREA")
+                           current_roi_forehead = ConvertToType(current_roi_forehead, "Float32")
+                           IF visualize THEN DrawRectangle(display_frame, bbox_forehead, color=(255,0,0))
+                        ENDIF
+                    ENDIF
+                    // Left Cheek (similar logic)
+                    landmarks_left_px = SelectRows(landmarks_px, LANDMARK_INDICES["LEFT_CHEEK"])
+                    bbox_left = GetBoundingBox(landmarks_left_px)
+                    IF bbox_left IS NOT NULL THEN
+                        roi_raw_left = ExtractROI(frame, bbox_left)
+                        IF IsValidImage(roi_raw_left) THEN
+                           current_roi_left_cheek = CV.Resize(roi_raw_left, ROI_SIZE, interpolation="AREA")
+                           current_roi_left_cheek = ConvertToType(current_roi_left_cheek, "Float32")
+                           IF visualize THEN DrawRectangle(display_frame, bbox_left, color=(0,0,255))
+                        ENDIF
+                    ENDIF
+                    // Right Cheek (similar logic)
+                    landmarks_right_px = SelectRows(landmarks_px, LANDMARK_INDICES["RIGHT_CHEEK"])
+                    bbox_right = GetBoundingBox(landmarks_right_px)
+                    IF bbox_right IS NOT NULL THEN
+                        roi_raw_right = ExtractROI(frame, bbox_right)
+                        IF IsValidImage(roi_raw_right) THEN
+                           current_roi_right_cheek = CV.Resize(roi_raw_right, ROI_SIZE, interpolation="AREA")
+                           current_roi_right_cheek = ConvertToType(current_roi_right_cheek, "Float32")
+                           IF visualize THEN DrawRectangle(display_frame, bbox_right, color=(0,255,255))
+                        ENDIF
+                    ENDIF
+
+                    // --- Feature Calculation (Paths A & B) ---
+                    // Path A: Wavelet Features (Temporal Difference: t-1 to t)
+                    IF prev_roi_forehead IS NOT NULL AND current_roi_forehead IS NOT NULL THEN
+                        diff_forehead = current_roi_forehead - prev_roi_forehead
+                        wavelet_fv_forehead = ExtractWaveletFeatures(diff_forehead) // Vector
+                    ENDIF
+                    IF prev_roi_left_cheek IS NOT NULL AND current_roi_left_cheek IS NOT NULL THEN
+                        diff_left_cheek = current_roi_left_cheek - prev_roi_left_cheek
+                        wavelet_fv_left_cheek = ExtractWaveletFeatures(diff_left_cheek) // Vector
+                    ENDIF
+                    IF prev_roi_right_cheek IS NOT NULL AND current_roi_right_cheek IS NOT NULL THEN
+                        diff_right_cheek = current_roi_right_cheek - prev_roi_right_cheek
+                        wavelet_fv_right_cheek = ExtractWaveletFeatures(diff_right_cheek) // Vector
+                    ENDIF
+
+                    // Path B: Block Features (Spatial: frame t)
+                    IF current_roi_forehead IS NOT NULL THEN
+                        block_fv_forehead = ExtractBlockFeatures(current_roi_forehead) // Vector
+                    ENDIF
+                    IF current_roi_left_cheek IS NOT NULL THEN
+                        block_fv_left_cheek = ExtractBlockFeatures(current_roi_left_cheek) // Vector
+                    ENDIF
+                    IF current_roi_right_cheek IS NOT NULL THEN
+                        block_fv_right_cheek = ExtractBlockFeatures(current_roi_right_cheek) // Vector
+                    ENDIF
+
+                    // --- Feature Combination (Wavelet[t] + Block[t-1]) ---
+                    IF wavelet_fv_forehead IS NOT NULL AND prev_block_fv_forehead IS NOT NULL THEN
+                        combined_fv = Concatenate(wavelet_fv_forehead, prev_block_fv_forehead)
+                        AddToList(combined_features_forehead, combined_fv)
+                    ENDIF
+                    IF wavelet_fv_left_cheek IS NOT NULL AND prev_block_fv_left_cheek IS NOT NULL THEN
+                        combined_fv = Concatenate(wavelet_fv_left_cheek, prev_block_fv_left_cheek)
+                        AddToList(combined_features_left_cheek, combined_fv)
+                    ENDIF
+                    IF wavelet_fv_right_cheek IS NOT NULL AND prev_block_fv_right_cheek IS NOT NULL THEN
+                        combined_fv = Concatenate(wavelet_fv_right_cheek, prev_block_fv_right_cheek)
+                        AddToList(combined_features_right_cheek, combined_fv)
+                    ENDIF
+
+                    // Draw landmarks if visualize
+                    IF visualize THEN DrawLandmarks(display_frame, landmarks_normalized)
+
+                ELSE // No landmarks detected this frame
+                    // Reset previous states to avoid combining across gaps
+                    prev_roi_forehead = NULL
+                    prev_roi_left_cheek = NULL
+                    prev_roi_right_cheek = NULL
+                    prev_block_fv_forehead = NULL
+                    prev_block_fv_left_cheek = NULL
+                    prev_block_fv_right_cheek = NULL
+                ENDIF // End landmark processing
+
+                // --- Update Previous State ---
+                prev_roi_forehead = current_roi_forehead
+                prev_roi_left_cheek = current_roi_left_cheek
+                prev_roi_right_cheek = current_roi_right_cheek
+                prev_block_fv_forehead = block_fv_forehead
+                prev_block_fv_left_cheek = block_fv_left_cheek
+                prev_block_fv_right_cheek = block_fv_right_cheek
+
+                // --- Visualization & Exit ---
+                IF visualize THEN
+                    ShowImage("Processed Video", display_frame)
+                    key = WaitKey(1) // Wait 1ms
+                    IF key == 'q' THEN BREAK
+                ENDIF
+
+                frame_index = frame_index + 1
+            END WHILE // End video frame loop
+
+            // --- Post-Loop: STI Construction ---
+            final_sti_forehead = NULL
+            final_sti_left_cheek = NULL
+            final_sti_right_cheek = NULL
+
+            IF Length(combined_features_forehead) > 0 THEN
+                final_sti_forehead = ConstructResizeSTI(combined_features_forehead, STI_SIZE) // Image[H_sti, W_sti]
+                IF visualize AND final_sti_forehead IS NOT NULL THEN ShowImage("Forehead STI", NormalizeForDisplay(final_sti_forehead))
+            ENDIF
+            IF Length(combined_features_left_cheek) > 0 THEN
+                final_sti_left_cheek = ConstructResizeSTI(combined_features_left_cheek, STI_SIZE)
+                IF visualize AND final_sti_left_cheek IS NOT NULL THEN ShowImage("Left Cheek STI", NormalizeForDisplay(final_sti_left_cheek))
+            ENDIF
+            IF Length(combined_features_right_cheek) > 0 THEN
+                final_sti_right_cheek = ConstructResizeSTI(combined_features_right_cheek, STI_SIZE)
+                IF visualize AND final_sti_right_cheek IS NOT NULL THEN ShowImage("Right Cheek STI", NormalizeForDisplay(final_sti_right_cheek))
+            ENDIF
+
+             IF visualize AND (final_sti_forehead OR final_sti_left_cheek OR final_sti_right_cheek) THEN
+                 WaitKey(0) // Wait indefinitely
+             ENDIF
+
+            // --- Stack STIs for CNN Input ---
+            stacked_input_sti = NULL // Image[3, H_sti, W_sti]
+            IF final_sti_forehead IS NOT NULL AND final_sti_left_cheek IS NOT NULL AND final_sti_right_cheek IS NOT NULL THEN
+                stacked_input_sti = Stack([final_sti_forehead, final_sti_left_cheek, final_sti_right_cheek], axis=0) // Stack along channel dimension
+                Print("Stacked STI Shape: ", GetShape(stacked_input_sti))
+            ELSE
+                Print("Warning: Could not create stacked STI.")
+            ENDIF
+            // 'stacked_input_sti' is the final output of video preprocessing
+
+        ELSEIF is_image THEN
+            // --- Image Processing Path (Simpler: Extract ROIs only) ---
+            Print("Processing image...")
+            frame = ReadImage(input_path)
+            IF frame IS NULL THEN THROW Error("Cannot read image")
+            display_frame = Copy(frame)
+
+            // Detect landmarks (timestamp=0)
+            detection_result = face_landmarker.DetectForVideo(frame, 0)
+
+            IF detection_result AND HasLandmarks(detection_result) THEN
+                 landmarks_normalized = GetLandmarks(detection_result, index=0)
+                 frame_height, frame_width = GetImageDimensions(frame)
+                 landmarks_px = DenormalizeLandmarks(landmarks_normalized, frame_width, frame_height)
+
+                 // Extract, Standardize, and Print/Visualize ROIs (no STI generation)
+                 landmarks_forehead_px = SelectRows(landmarks_px, LANDMARK_INDICES["FOREHEAD"])
+                 bbox_forehead = GetBoundingBox(landmarks_forehead_px)
+                 IF bbox_forehead IS NOT NULL THEN
+                     roi_raw_forehead = ExtractROI(frame, bbox_forehead)
+                     IF IsValidImage(roi_raw_forehead) THEN
+                         standardized_forehead = CV.Resize(roi_raw_forehead, ROI_SIZE, interpolation="AREA")
+                         Print("Standardized Forehead ROI Shape:", GetShape(standardized_forehead))
+                         IF visualize THEN DrawRectangle(display_frame, bbox_forehead, color=(255,0,0))
+                     ENDIF
+                 ENDIF
+                 // ... similar logic for left and right cheeks ...
+
+                 IF visualize THEN DrawLandmarks(display_frame, landmarks_normalized)
+            ENDIF
+
+            IF visualize THEN
+                 ShowImage("Processed Image", display_frame)
+                 WaitKey(0)
+            ENDIF
+
+        ELSE
+            Print("Error: Unsupported file type")
+        ENDIF // End Video/Image Path
+
+    CATCH Exception as e
+        Print("Error:", e)
+        Print traceback // Optional
+
+    FINALLY
+        // --- Resource Cleanup ---
+        IF IsVideoOpen(video_capture) THEN ReleaseVideo(video_capture)
+        DestroyAllWindows()
+        IF face_landmarker IS NOT NULL THEN
+            TRY
+                face_landmarker.Close()
+            CATCH Exception as close_err
+                 Print("Error closing landmarker:", close_err)
+            END TRY
+        ENDIF
+        // Clean up temporary video file
+        IF converted_video_path IS NOT NULL AND FileExists(converted_video_path) THEN
+            TRY
+                DeleteFile(converted_video_path)
+                Print("Removed temp file:", converted_video_path)
+            CATCH Exception as delete_err
+                Print("Error removing temp file:", delete_err)
+            END TRY
+        ENDIF
+    END TRY
+
+END FUNCTION // Main
+
+// --- Feature Extraction Sub-Functions ---
+
+FUNCTION ExtractWaveletFeatures(diff_frame : Image[H_roi, W_roi, 3]) -> Vector // Or NULL
+    // Input should be Float32
+    IF diff_frame IS NULL THEN RETURN NULL
+    all_channel_features = New List()
+    num_channels = GetShape(diff_frame)[2] // Should be 3
+
+    FOR c = 0 TO num_channels - 1
+        channel_data = GetChannel(diff_frame, c) // Image[H_roi, W_roi]
+        // Apply 3-level 2D DWT using 'db4' wavelet
+        coeffs = DWT.Decompose2D(channel_data, wavelet='db4', levels=3)
+        // coeffs structure: [cA3, (cH3, cV3, cD3), (cH2, cV2, cD2), (cH1, cV1, cD1)]
+
+        // Extract HL (cH) and LH (cV) subbands for levels 1, 2, 3
+        cH1, cV1, _ = DWT.ExtractSubbands(coeffs, level=1)
+        cH2, cV2, _ = DWT.ExtractSubbands(coeffs, level=2)
+        cH3, cV3, _ = DWT.ExtractSubbands(coeffs, level=3)
+
+        // Calculate projections
+        proj_HL1 = Math.Sum(cH1, axis=0) // Horizontal projection (sum columns) -> Vector[W_sub1]
+        proj_LH1 = Math.Sum(cV1, axis=1) // Vertical projection (sum rows) -> Vector[H_sub1]
+        proj_HL2 = Math.Sum(cH2, axis=0)
+        proj_LH2 = Math.Sum(cV2, axis=1)
+        proj_HL3 = Math.Sum(cH3, axis=0)
+        proj_LH3 = Math.Sum(cV3, axis=1)
+
+        // Concatenate projections into channel feature vector
+        channel_fv = Concatenate([proj_HL1, proj_LH1, proj_HL2, proj_LH2, proj_HL3, proj_LH3])
+        AddToList(all_channel_features, channel_fv)
+    END FOR
+
+    IF Length(all_channel_features) != num_channels THEN RETURN NULL // Error during processing
+
+    // Concatenate features from all channels
+    combined_feature_vector = Concatenate(all_channel_features)
+    RETURN combined_feature_vector
+END FUNCTION
+
+FUNCTION ExtractBlockFeatures(roi_frame : Image[H_roi, W_roi, 3]) -> Vector // Or NULL
+    // Input should be Float32
+    IF roi_frame IS NULL THEN RETURN NULL
+
+    // 1. Apply MSR
+    msr_roi = ApplyMSR(roi_frame, scales=[15, 80, 200])
+    IF msr_roi IS NULL THEN RETURN NULL
+
+    // 2. Fuse RGB and MSR
+    fused_roi = FuseRGB_MSR(roi_frame, msr_roi)
+    IF fused_roi IS NULL THEN RETURN NULL
+
+    // 3. Extract Block Averages
+    block_features = ExtractBlockAverages(fused_roi, num_blocks_sqrt=4) // Vector[4*4*3 = 48]
+    RETURN block_features
+END FUNCTION
+
+FUNCTION ApplyMSR(image : Image[H, W, C], scales : List) -> Image[H, W, C] // Or NULL
+    // Assumes image is Float32
+    IF image IS NULL THEN RETURN NULL
+    epsilon = 1e-6
+    msr_output = CreateZeros(GetShape(image), type="Float32")
+    num_scales = Length(scales)
+    weight = 1.0 / num_scales
+
+    FOR c = 0 TO GetShape(image)[2] - 1
+        channel = GetChannel(image, c)
+        log_channel = Math.Log10(channel + epsilon)
+
+        FOR s IN scales
+            // Gaussian blur with sigma = s
+            blurred_channel = CV.GaussianBlur(channel, sigma=s)
+            log_blurred = Math.Log10(blurred_channel + epsilon)
+            diff = log_channel - log_blurred
+            msr_output[:, :, c] = msr_output[:, :, c] + weight * diff
+        END FOR
+    END FOR
+    RETURN msr_output
+END FUNCTION
+
+FUNCTION FuseRGB_MSR(rgb : Image[H, W, C], msr : Image[H, W, C]) -> Image[H, W, C] // Or NULL
+    // Assumes inputs are Float32
+    IF rgb IS NULL OR msr IS NULL OR GetShape(rgb) != GetShape(msr) THEN RETURN NULL
+    k_size = 5 // Mean filter kernel size
+    epsilon = 1e-12
+
+    // Base Layers (using mean/box filter)
+    base1 = CV.MeanFilter(rgb, kernel_size=k_size)
+    base2 = CV.MeanFilter(msr, kernel_size=k_size)
+    fused_base = (base1 + base2) / 2.0
+
+    // Detail Layers
+    detail1 = rgb - base1
+    detail2 = msr - base2
+
+    // Saliency Maps (per-channel absolute detail)
+    saliency1 = Math.Abs(detail1)
+    saliency2 = Math.Abs(detail2)
+
+    // Weight Maps (per-channel)
+    total_saliency = saliency1 + saliency2 + epsilon
+    weight1 = saliency1 / total_saliency
+    weight2 = saliency2 / total_saliency // or 1.0 - weight1
+
+    // Fuse Detail Layers
+    fused_detail = weight1 * detail1 + weight2 * detail2
+
+    // Combine
+    gamma = fused_base + fused_detail
+    RETURN gamma
+END FUNCTION
+
+FUNCTION ExtractBlockAverages(fused_roi : Image[H, W, C], num_blocks_sqrt : Integer) -> Vector // Or NULL
+    // Assumes input is Float32
+    IF fused_roi IS NULL THEN RETURN NULL
+    H, W, C = GetShape(fused_roi)
+    num_blocks = num_blocks_sqrt * num_blocks_sqrt
+    block_features_list = New List()
+
+    block_h = H // num_blocks_sqrt
+    block_w = W // num_blocks_sqrt
+    IF block_h == 0 OR block_w == 0 THEN RETURN NULL // ROI too small
+
+    FOR r = 0 TO num_blocks_sqrt - 1
+        FOR c_block = 0 TO num_blocks_sqrt - 1
+            y1 = r * block_h
+            y2 = y1 + block_h
+            x1 = c_block * block_w
+            x2 = x1 + block_w
+            block = GetSubImage(fused_roi, y1, y2, x1, x2) // Image[block_h, block_w, C]
+            IF GetSize(block) > 0 THEN
+                avg_vals = Math.Mean(block, axis=(0, 1)) // Vector[C]
+                AddToList(block_features_list, avg_vals)
+            ELSE
+                AddToList(block_features_list, CreateZeros(C)) // Handle empty block
+            ENDIF
+        END FOR
+    END FOR
+
+    // Flatten the list of vectors [block1_rgb, block2_rgb, ...]
+    RETURN Flatten(Concatenate(block_features_list)) // Vector[num_blocks * C]
+END FUNCTION
+
+FUNCTION ConstructResizeSTI(feature_vector_sequence : List[Vector], target_size : Tuple[W, H]) -> Image[H, W] // Or NULL
+    IF Length(feature_vector_sequence) == 0 THEN RETURN NULL
+    // Vertically stack the feature vectors
+    sti = VerticalStack(feature_vector_sequence) // Matrix[num_vectors, vector_length]
+    sti_float = ConvertToType(sti, "Float32")
+    // Resize to target size (Width, Height)
+    resized_sti = CV.Resize(sti_float, target_size, interpolation="LINEAR") // Image[H, W]
+    RETURN resized_sti
+END FUNCTION
+
+
+// --- CNN Model & Training (Simplified Pseudocode) ---
+
+CLASS Enhanced_HR_CNN
+    // Define Layers (using ML library components)
+    CONSTRUCTOR(dropout_rate, use_pretrained)
+        base_model = LoadResNet18(pretrained=use_pretrained)
+        self.conv1 = ML.Conv2D(in_channels=3, out_channels=64, kernel=7, stride=2, padding=3)
+        IF use_pretrained THEN CopyWeights(self.conv1, base_model.conv1) ENDIF
+        self.bn1 = base_model.bn1
+        self.relu = base_model.relu
+        self.maxpool = base_model.maxpool
+        self.layer1 = base_model.layer1 // Output 64 channels
+        self.layer2 = base_model.layer2 // Output 128 channels
+        self.attention1 = AttentionBlock(in_channels=128)
+        self.layer3 = base_model.layer3 // Output 256 channels
+        self.layer4 = base_model.layer4 // Output 512 channels
+        self.attention2 = AttentionBlock(in_channels=512)
+        self.pool = ML.AdaptiveAvgPool2D(output_size=1)
+        total_features = 512 + 256 + 128
+        self.mlp_head = MLPHead(in_features=total_features, hidden_dim=256, dropout_rate=dropout_rate)
+    END CONSTRUCTOR
+
+    FORWARD(x : Tensor[N, 3, H_sti, W_sti]) -> Tensor[N, 1]
+        // Input Standardization
+        mean = Math.Mean(x, axis=(2, 3), keepdims=True)
+        std = Math.StdDev(x, axis=(2, 3), keepdims=True)
+        x = (x - mean) / (std + 1e-5)
+
+        // Backbone
+        x = self.conv1(x); x = self.bn1(x); x = self.relu(x); x = self.maxpool(x)
+        x1 = self.layer1(x)
+        x2 = self.layer2(x1)
+        x2_att = self.attention1(x2)
+        x3 = self.layer3(x2_att)
+        x4 = self.layer4(x3)
+        x4_att = self.attention2(x4)
+
+        // Multi-scale Feature Extraction
+        f2 = Flatten(self.pool(x2_att)) // Features from Layer 2 + Attention
+        f3 = Flatten(self.pool(x3))      // Features from Layer 3
+        f4_main = Flatten(self.pool(x4_att)) // Features from Layer 4 + Attention
+
+        // Concatenate & Regress
+        combined = Concatenate([f4_main, f3, f2], axis=1)
+        output = self.mlp_head(combined)
+        RETURN output
+    END FORWARD
+END CLASS
+
+CLASS AttentionBlock
+    CONSTRUCTOR(in_channels)
+        inter_channels = Max(1, in_channels // 8)
+        self.conv_q = ML.Conv2D(in_channels, inter_channels, kernel=1)
+        self.conv_k = ML.Conv2D(in_channels, inter_channels, kernel=1)
+        self.conv_v = ML.Conv2D(in_channels, in_channels, kernel=1)
+        self.gamma = LearnableParameter(initial_value=0.0)
+    END CONSTRUCTOR
+
+    FORWARD(x : Tensor[N, C, H, W]) -> Tensor[N, C, H, W]
+        query = Reshape(self.conv_q(x)) // N, HW, C_inter
+        key = Reshape(self.conv_k(x))   // N, C_inter, HW
+        value = Reshape(self.conv_v(x)) // N, C, HW
+
+        energy = BatchMatMul(query, key) // N, HW, HW
+        attention_map = ML.Softmax(energy, axis=-1)
+
+        weighted_value = BatchMatMul(value, attention_map.Transpose(1, 2)) // N, C, HW
+        weighted_value = Reshape(weighted_value, shape=(N, C, H, W))
+
+        RETURN self.gamma * weighted_value + x // Residual connection
+    END FORWARD
+END CLASS
+
+CLASS MLPHead
+    CONSTRUCTOR(in_features, hidden_dim, dropout_rate)
+        self.fc1 = ML.Linear(in_features, hidden_dim)
+        self.bn = ML.BatchNorm1D(hidden_dim)
+        self.relu = ML.ReLU()
+        self.dropout = ML.Dropout(dropout_rate)
+        self.fc2 = ML.Linear(hidden_dim, 64)
+        self.fc3 = ML.Linear(64, 1) // Output 1 value (HR)
+    END CONSTRUCTOR
+
+    FORWARD(x : Tensor[N, F]) -> Tensor[N, 1]
+        x = self.fc1(x)
+        IF GetShape(x)[0] > 1 THEN x = self.bn(x) ENDIF // Apply BN if batch size > 1
+        x = self.relu(x)
+        x = self.dropout(x)
+        x = self.fc2(x)
+        x = self.relu(x)
+        x = self.fc3(x)
+        RETURN x
+    END FORWARD
+END CLASS
+
+FUNCTION HREstimationLoss(prediction : Tensor[N, 1], target : Tensor[N, 1]) -> Scalar
+    mse_loss = ML.MeanSquaredError(prediction, target)
+    l1_loss = ML.MeanAbsoluteError(prediction, target)
+
+    // Correlation Loss (Negative Pearson Correlation)
+    vx = prediction - Math.Mean(prediction)
+    vy = target - Math.Mean(target)
+    std_vx = Math.StdDev(prediction)
+    std_vy = Math.StdDev(target)
+    epsilon = 1e-6
+    IF std_vx > epsilon AND std_vy > epsilon THEN
+        corr_num = Math.Sum(vx * vy)
+        corr_den = Math.Sqrt(Math.Sum(vx * vx)) * Math.Sqrt(Math.Sum(vy * vy))
+        corr_loss = - (corr_num / (corr_den + epsilon))
+    ELSE
+        corr_loss = 0.0
+    ENDIF
+
+    // Weighted combination (example weights)
+    w_mse=1.0; w_l1=0.5; w_corr=0.3
+    total_loss = w_mse * mse_loss + w_l1 * l1_loss + w_corr * corr_loss
+    RETURN total_loss
+END FUNCTION
+
+// --- Training Loop Outline (Conceptual) ---
+PROCEDURE TrainModel(model, train_dataloader, val_dataloader, optimizer, criterion, scheduler, epochs, device)
+    FOR e = 1 TO epochs
+        // --- Training Epoch ---
+        model.SetMode("train")
+        epoch_train_loss = 0
+        FOR batch_inputs, batch_targets IN train_dataloader
+             batch_inputs = MoveToDevice(batch_inputs, device)
+             batch_targets = MoveToDevice(batch_targets, device)
+             // Apply Augmentations (Flip, Noise)
+             augmented_inputs = ApplyAugmentation(batch_inputs)
+
+             optimizer.ZeroGradients()
+             outputs = model.Forward(augmented_inputs)
+             loss = criterion(outputs, batch_targets)
+             loss.Backward()
+             ClipGradients(model.parameters, max_norm=1.0)
+             optimizer.Step()
+             epoch_train_loss += loss.GetValue()
+        END FOR
+        Print("Epoch", e, "Train Loss:", epoch_train_loss / Length(train_dataloader))
+
+        // --- Validation Epoch ---
+        model.SetMode("eval")
+        epoch_val_loss = 0
+        all_preds = New List(); all_targets = New List()
+        WITH NoGradientCalculation():
+            FOR batch_inputs, batch_targets IN val_dataloader
+                 batch_inputs = MoveToDevice(batch_inputs, device)
+                 batch_targets = MoveToDevice(batch_targets, device)
+                 outputs = model.Forward(batch_inputs)
+                 loss = criterion(outputs, batch_targets)
+                 epoch_val_loss += loss.GetValue()
+                 AddToList(all_preds, outputs.Detach())
+                 AddToList(all_targets, batch_targets.Detach())
+            END FOR
+        END WITH
+        val_loss = epoch_val_loss / Length(val_dataloader)
+        // Calculate Metrics (MAE, RMSE) from all_preds, all_targets
+        Print("Epoch", e, "Val Loss:", val_loss, "MAE:", mae, "RMSE:", rmse)
+
+        // Update Learning Rate Scheduler
+        scheduler.Step(val_loss)
+
+        // Add Model Saving Logic (Best model based on val_loss)
+    END FOR
+END PROCEDURE
+
+FUNCTION ApplyAugmentation(batch_inputs : Tensor) -> Tensor
+     // Random Horizontal Flip
+     IF RandomFloat() > 0.5 THEN batch_inputs = Flip(batch_inputs, axis=3) ENDIF
+     // Random Noise Addition
+     IF RandomFloat() > 0.5 THEN
+         noise = RandomNormal(GetShape(batch_inputs)) * 0.05
+         batch_inputs = batch_inputs + noise
+     ENDIF
+     RETURN batch_inputs
+END FUNCTION
